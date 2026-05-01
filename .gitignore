@@ -1,0 +1,15 @@
+build/
+
+.vs/
+.vscode/
+*.user
+*.suo
+*.tmp
+*.log
+
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
