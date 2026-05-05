@@ -6,12 +6,20 @@ Raspberry Pi stereo camera capture, encoding, and Ethernet streaming stack for t
 
 This repository owns the Pi-side code:
 
+- `native/edge_camera`
+  - foreground / mask primitives (chroma key, NV12 in-place mask apply,
+    morph grow, frame ring)
+  - clock sync + stereo sync helpers
+  - stats / security / preprocess scaffolding
+  - currently building blocks; not yet wired into `stream_sender` (see
+    upstream `MetaPuppet` issue tracker for the integration plan)
 - `native/stream_sender`
   - `libcamera` stereo capture
-  - SBS composition
-  - low-latency H.264 encode path
+  - SBS composition (I420 and NV12)
+  - low-latency H.264 encode path (v4l2h264enc / x264enc fallback)
   - UDP packetization and transmission
-- `tools/pi`
+  - `mps_pack_bench` microbenchmark for I420 vs NV12 SBS pack
+- `tools`
   - Pi bootstrap and build scripts
   - runtime checks
   - direct Ethernet helper scripts
