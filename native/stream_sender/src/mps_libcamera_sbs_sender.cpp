@@ -1,5 +1,6 @@
 #include "mps_udp_sender.h"
 #include "mps_i420_sbs.h"
+#include "mps_nv12_sbs.h"
 #include "mps_latency_gate.h"
 
 #include <libcamera/framebuffer_allocator.h>
@@ -89,12 +90,13 @@ public:
         destroy();
     }
 
-    int init(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate_kbps, bool prefer_software)
+    int init(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate_kbps, bool prefer_software, bool use_nv12_input)
     {
         width_ = width;
         height_ = height;
         fps_ = fps ? fps : 30u;
         frame_duration_ns_ = 1000000000ull / fps_;
+        use_nv12_input_ = use_nv12_input;
 
         gst_init(nullptr, nullptr);
         if (prefer_software) {
@@ -163,17 +165,19 @@ private:
         destroy();
 
         char description[2048];
+        const char* input_format = use_nv12_input_ ? "NV12" : "I420";
         if (hardware) {
             std::snprintf(description,
                           sizeof(description),
                           "appsrc name=src is-live=true block=false format=time do-timestamp=false "
                           "max-buffers=1 max-bytes=0 max-time=0 leaky-type=downstream "
-                          "caps=video/x-raw,format=I420,width=%u,height=%u,framerate=%u/1 "
+                          "caps=video/x-raw,format=%s,width=%u,height=%u,framerate=%u/1 "
                           "! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
                           "! v4l2h264enc extra-controls=\"controls,video_bitrate=%u\" "
                           "! h264parse config-interval=-1 "
                           "! video/x-h264,stream-format=byte-stream,alignment=au "
                           "! appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true",
+                          input_format,
                           width,
                           height,
                           fps,
@@ -183,7 +187,7 @@ private:
                           sizeof(description),
                           "appsrc name=src is-live=true block=false format=time do-timestamp=false "
                           "max-buffers=1 max-bytes=0 max-time=0 leaky-type=downstream "
-                          "caps=video/x-raw,format=I420,width=%u,height=%u,framerate=%u/1 "
+                          "caps=video/x-raw,format=%s,width=%u,height=%u,framerate=%u/1 "
                           "! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
                           "! videoconvert "
                           "! x264enc tune=zerolatency speed-preset=ultrafast bitrate=%u key-int-max=%u bframes=0 "
@@ -191,6 +195,7 @@ private:
                           "! h264parse config-interval=-1 "
                           "! video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline "
                           "! appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true",
+                          input_format,
                           width,
                           height,
                           fps,
@@ -245,6 +250,7 @@ private:
     uint32_t height_ = 0;
     uint32_t fps_ = 30;
     uint64_t frame_duration_ns_ = 33333333ull;
+    bool use_nv12_input_ = false;
 };
 #endif
 
@@ -597,8 +603,10 @@ int main(int argc, char** argv)
     const uint64_t max_encode_age_ns = argc > 13
         ? static_cast<uint64_t>(std::strtoull(argv[13], nullptr, 10)) * 1000000ull
         : (fps ? 3000000000ull / static_cast<uint64_t>(fps) : 100000000ull);
+    const std::string sbs_format = argc > 14 ? argv[14] : "i420";
     const bool use_h264 = codec == "h264" || codec == "H264";
     const bool prefer_software_encoder = encoder_mode == "software" || encoder_mode == "x264";
+    const bool use_nv12_pack = sbs_format == "nv12" || sbs_format == "NV12";
     std::mutex notify_mutex;
     std::condition_variable notify_cv;
     MpsUdpSender sender{};
@@ -606,7 +614,7 @@ int main(int argc, char** argv)
 
     if (eye_width < 160u || eye_height < 120u || (eye_width & 1u) != 0u || (eye_height & 1u) != 0u || fps == 0u) {
         std::fprintf(stderr,
-                     "usage: %s [host] [port] [eye_width] [eye_height] [fps] [left_camera] [right_camera] [max_skew_ms] [raw|h264] [bitrate_kbps] [auto|software] [max_pending_frames] [max_encode_age_ms]\n",
+                     "usage: %s [host] [port] [eye_width] [eye_height] [fps] [left_camera] [right_camera] [max_skew_ms] [raw|h264] [bitrate_kbps] [auto|software] [max_pending_frames] [max_encode_age_ms] [i420|nv12]\n",
                      argv[0]);
         return 1;
     }
@@ -653,9 +661,9 @@ int main(int argc, char** argv)
     eye_width = left.width();
     eye_height = left.height();
     const size_t rgba_size = static_cast<size_t>(eye_width) * 2u * eye_height * 4u;
-    const size_t sbs_i420_size = static_cast<size_t>(eye_width) * 2u * eye_height * 3u / 2u;
+    const size_t sbs_yuv_size = static_cast<size_t>(eye_width) * 2u * eye_height * 3u / 2u;
     std::vector<uint8_t> sbs_rgba(rgba_size);
-    std::vector<uint8_t> sbs_i420(use_h264 ? sbs_i420_size : 0u);
+    std::vector<uint8_t> sbs_yuv(use_h264 ? sbs_yuv_size : 0u);
     std::vector<uint8_t> encoded_frame;
     LatestFrame left_frame;
     LatestFrame right_frame;
@@ -672,7 +680,7 @@ int main(int argc, char** argv)
 #if defined(MPS_ENABLE_GSTREAMER)
     H264Encoder encoder;
     if (use_h264) {
-        rc = encoder.init(eye_width * 2u, eye_height, fps, bitrate_kbps, prefer_software_encoder);
+        rc = encoder.init(eye_width * 2u, eye_height, fps, bitrate_kbps, prefer_software_encoder, use_nv12_pack);
         if (rc != 0) {
             std::fprintf(stderr, "H.264 encoder init failed: %d\n", rc);
             manager.stop();
@@ -709,7 +717,8 @@ int main(int argc, char** argv)
                  mono_fallback ? " mono_fallback=1" : "");
     if (use_h264) {
         std::fprintf(stderr,
-                     "codec=h264 bitrate_kbps=%u encoder_mode=%s max_pending=%u max_encode_age_ms=%llu\n",
+                     "codec=h264 sbs_format=%s bitrate_kbps=%u encoder_mode=%s max_pending=%u max_encode_age_ms=%llu\n",
+                     use_nv12_pack ? "nv12" : "i420",
                      bitrate_kbps,
                      encoder_mode.c_str(),
                      max_pending_frames,
@@ -804,14 +813,23 @@ int main(int argc, char** argv)
                 continue;
             }
 
-            rc = mono_fallback
-                ? mps_i420_pack_sbs_mono(left_frame.yuv.data(), sbs_i420.data(), eye_width, eye_height)
-                : mps_i420_pack_sbs(left_frame.yuv.data(), right_frame.yuv.data(), sbs_i420.data(), eye_width, eye_height);
+            if (use_nv12_pack) {
+                rc = mps_yuv420_pack_sbs_nv12(
+                    left_frame.yuv.data(),
+                    mono_fallback ? left_frame.yuv.data() : right_frame.yuv.data(),
+                    sbs_yuv.data(),
+                    eye_width,
+                    eye_height);
+            } else {
+                rc = mono_fallback
+                    ? mps_i420_pack_sbs_mono(left_frame.yuv.data(), sbs_yuv.data(), eye_width, eye_height)
+                    : mps_i420_pack_sbs(left_frame.yuv.data(), right_frame.yuv.data(), sbs_yuv.data(), eye_width, eye_height);
+            }
             if (rc != 0) {
-                std::fprintf(stderr, "SBS I420 pack failed: %d\n", rc);
+                std::fprintf(stderr, "SBS %s pack failed: %d\n", use_nv12_pack ? "NV12" : "I420", rc);
                 break;
             }
-            rc = encoder.pushFrame(sbs_i420.data(), sbs_i420.size(), encode_sequence);
+            rc = encoder.pushFrame(sbs_yuv.data(), sbs_yuv.size(), encode_sequence);
             if (rc != 0) {
                 std::fprintf(stderr, "encoder push failed: %d\n", rc);
                 break;

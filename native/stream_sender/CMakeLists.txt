@@ -11,6 +11,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(metapuppet_stream_sender
     src/mps_i420_sbs.c
+    src/mps_nv12_sbs.c
     src/mps_latency_gate.c
     src/mps_packet_writer.c
     src/mps_udp_sender.c
@@ -30,6 +31,12 @@ add_executable(mps_pcvr_test_sender
 )
 
 target_link_libraries(mps_pcvr_test_sender PRIVATE metapuppet_stream_sender)
+
+add_executable(mps_pack_bench
+    src/mps_pack_bench.c
+)
+
+target_link_libraries(mps_pack_bench PRIVATE metapuppet_stream_sender)
 
 if(UNIX AND NOT APPLE)
     add_executable(mps_rpicam_sbs_sender
