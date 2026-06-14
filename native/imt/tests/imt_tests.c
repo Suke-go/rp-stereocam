@@ -3,6 +3,10 @@
  * Plain C, no framework (R9.1). Returns nonzero when any check fails.
  */
 
+#ifndef _WIN32
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "imt.h"
 
 #include <stdio.h>
