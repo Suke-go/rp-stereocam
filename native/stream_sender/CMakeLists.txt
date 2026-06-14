@@ -10,6 +10,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 add_library(metapuppet_stream_sender
+    src/mps_frame_envelope.c
+    src/mps_i420_foreground_mask.c
     src/mps_i420_sbs.c
     src/mps_latency_gate.c
     src/mps_packet_writer.c

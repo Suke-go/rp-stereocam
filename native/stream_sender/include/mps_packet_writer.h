@@ -19,6 +19,10 @@ typedef enum MpsPacketFlags {
     MPS_PACKET_FLAG_KEYFRAME = 1u << 0,
     MPS_PACKET_FLAG_CODEC_CONFIG = 1u << 1,
     MPS_PACKET_FLAG_END_OF_FRAME = 1u << 2,
+    MPS_PACKET_FLAG_FEC_PRESENT = 1u << 3,
+    MPS_PACKET_FLAG_FEC_XOR_PARITY = 1u << 4,
+    MPS_PACKET_FLAG_FRAME_ENVELOPE = 1u << 5,
+    MPS_PACKET_FLAG_MASK_PRESENT = 1u << 6,
     MPS_PACKET_FLAG_RAW_RGBA = 1u << 16
 } MpsPacketFlags;
 
@@ -42,6 +46,18 @@ int mps_packet_writer_make(const MpsPacketWriter* writer,
                            uint8_t* out_datagram,
                            size_t out_capacity,
                            size_t* out_size);
+int mps_packet_writer_make_payload(const MpsPacketWriter* writer,
+                                   uint64_t frame_sequence,
+                                   uint64_t capture_timestamp_ns,
+                                   uint32_t flags,
+                                   uint32_t chunk_index,
+                                   uint32_t chunk_count,
+                                   const uint8_t* payload_data,
+                                   size_t payload_size,
+                                   size_t frame_size,
+                                   uint8_t* out_datagram,
+                                   size_t out_capacity,
+                                   size_t* out_size);
 void mps_packet_writer_advance(MpsPacketWriter* writer);
 
 #ifdef __cplusplus

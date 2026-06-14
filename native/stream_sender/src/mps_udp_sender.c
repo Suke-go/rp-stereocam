@@ -146,3 +146,119 @@ int mps_udp_sender_send_frame(MpsUdpSender* sender,
     sender->frames_sent += 1u;
     return 0;
 }
+
+int mps_udp_sender_send_frame_xor_fec(MpsUdpSender* sender,
+                                      const uint8_t* frame_data,
+                                      size_t frame_size,
+                                      uint64_t frame_sequence,
+                                      uint64_t capture_timestamp_ns,
+                                      uint32_t flags)
+{
+    uint32_t data_chunk_count;
+    uint32_t packet_count;
+    uint32_t chunk_index;
+    uint8_t parity[MPS_PACKET_MAX_PAYLOAD];
+
+    if (!sender || sender->socket_fd == 0 || !frame_data || frame_size == 0u) {
+        return -1;
+    }
+
+    data_chunk_count = (uint32_t)((frame_size + MPS_PACKET_MAX_PAYLOAD - 1u) / MPS_PACKET_MAX_PAYLOAD);
+    if (data_chunk_count == 0u || data_chunk_count + 1u > MPS_PACKET_MAX_CHUNKS || frame_size > 0xffffffffu) {
+        return -3;
+    }
+
+    packet_count = data_chunk_count + 1u;
+    memset(parity, 0, sizeof(parity));
+    for (chunk_index = 0; chunk_index < data_chunk_count; ++chunk_index) {
+        const size_t payload_offset = (size_t)chunk_index * MPS_PACKET_MAX_PAYLOAD;
+        size_t payload_size = frame_size - payload_offset;
+        size_t i;
+
+        if (payload_size > MPS_PACKET_MAX_PAYLOAD) {
+            payload_size = MPS_PACKET_MAX_PAYLOAD;
+        }
+        for (i = 0; i < payload_size; ++i) {
+            parity[i] ^= frame_data[payload_offset + i];
+        }
+    }
+
+    for (chunk_index = 0; chunk_index < data_chunk_count; ++chunk_index) {
+        uint8_t datagram[MPS_PACKET_MAX_DATAGRAM];
+        size_t out_size = 0;
+        const size_t payload_offset = (size_t)chunk_index * MPS_PACKET_MAX_PAYLOAD;
+        size_t payload_size = frame_size - payload_offset;
+        int sent;
+        int rc;
+
+        if (payload_size > MPS_PACKET_MAX_PAYLOAD) {
+            payload_size = MPS_PACKET_MAX_PAYLOAD;
+        }
+
+        rc = mps_packet_writer_make(&sender->writer,
+                                    frame_sequence,
+                                    capture_timestamp_ns,
+                                    flags | MPS_PACKET_FLAG_FEC_PRESENT,
+                                    chunk_index,
+                                    packet_count,
+                                    frame_data,
+                                    frame_size,
+                                    payload_offset,
+                                    payload_size,
+                                    datagram,
+                                    sizeof(datagram),
+                                    &out_size);
+        if (rc != 0) {
+            return rc;
+        }
+
+        sent = (int)sendto((mps_socket_t)sender->socket_fd,
+                           (const char*)datagram,
+                           (int)out_size,
+                           0,
+                           (const struct sockaddr*)&g_sender_private.addr,
+                           sizeof(g_sender_private.addr));
+        if (sent == SOCKET_ERROR || (size_t)sent != out_size) {
+            return -2;
+        }
+
+        mps_packet_writer_advance(&sender->writer);
+        sender->packets_sent += 1u;
+    }
+
+    {
+        uint8_t datagram[MPS_PACKET_MAX_DATAGRAM];
+        size_t out_size = 0;
+        int sent;
+        const int rc = mps_packet_writer_make_payload(&sender->writer,
+                                                      frame_sequence,
+                                                      capture_timestamp_ns,
+                                                      flags | MPS_PACKET_FLAG_FEC_PRESENT | MPS_PACKET_FLAG_FEC_XOR_PARITY,
+                                                      data_chunk_count,
+                                                      packet_count,
+                                                      parity,
+                                                      sizeof(parity),
+                                                      frame_size,
+                                                      datagram,
+                                                      sizeof(datagram),
+                                                      &out_size);
+        if (rc != 0) {
+            return rc;
+        }
+
+        sent = (int)sendto((mps_socket_t)sender->socket_fd,
+                           (const char*)datagram,
+                           (int)out_size,
+                           0,
+                           (const struct sockaddr*)&g_sender_private.addr,
+                           sizeof(g_sender_private.addr));
+        if (sent == SOCKET_ERROR || (size_t)sent != out_size) {
+            return -2;
+        }
+        mps_packet_writer_advance(&sender->writer);
+        sender->packets_sent += 1u;
+    }
+
+    sender->frames_sent += 1u;
+    return 0;
+}
