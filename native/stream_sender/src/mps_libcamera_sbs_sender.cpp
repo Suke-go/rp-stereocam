@@ -1,4 +1,6 @@
 #include "mps_udp_sender.h"
+#include "mps_frame_envelope.h"
+#include "mps_i420_foreground_mask.h"
 #include "mps_i420_sbs.h"
 #include "mps_latency_gate.h"
 
@@ -89,7 +91,13 @@ public:
         destroy();
     }
 
-    int init(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate_kbps, bool prefer_software)
+    int init(uint32_t width,
+             uint32_t height,
+             uint32_t fps,
+             uint32_t bitrate_kbps,
+             bool prefer_software,
+             bool intra_refresh,
+             uint32_t slice_max_size)
     {
         width_ = width;
         height_ = height;
@@ -98,11 +106,11 @@ public:
 
         gst_init(nullptr, nullptr);
         if (prefer_software) {
-            if (tryCreatePipeline(width, height, fps_, bitrate_kbps, false) != 0) {
+            if (tryCreatePipeline(width, height, fps_, bitrate_kbps, false, intra_refresh, slice_max_size) != 0) {
                 return -1;
             }
-        } else if (tryCreatePipeline(width, height, fps_, bitrate_kbps, true) != 0 &&
-                   tryCreatePipeline(width, height, fps_, bitrate_kbps, false) != 0) {
+        } else if (tryCreatePipeline(width, height, fps_, bitrate_kbps, true, intra_refresh, slice_max_size) != 0 &&
+                   tryCreatePipeline(width, height, fps_, bitrate_kbps, false, intra_refresh, slice_max_size) != 0) {
             return -1;
         }
 
@@ -158,7 +166,13 @@ public:
     }
 
 private:
-    int tryCreatePipeline(uint32_t width, uint32_t height, uint32_t fps, uint32_t bitrate_kbps, bool hardware)
+    int tryCreatePipeline(uint32_t width,
+                          uint32_t height,
+                          uint32_t fps,
+                          uint32_t bitrate_kbps,
+                          bool hardware,
+                          bool intra_refresh,
+                          uint32_t slice_max_size)
     {
         destroy();
 
@@ -179,6 +193,11 @@ private:
                           fps,
                           bitrate_kbps * 1000u);
         } else {
+            char option_string[128] = "";
+            const uint32_t key_int_max = intra_refresh ? fps * 60u : fps;
+            if (slice_max_size > 0u) {
+                std::snprintf(option_string, sizeof(option_string), "option-string=\"slice-max-size=%u\" ", slice_max_size);
+            }
             std::snprintf(description,
                           sizeof(description),
                           "appsrc name=src is-live=true block=false format=time do-timestamp=false "
@@ -187,7 +206,7 @@ private:
                           "! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
                           "! videoconvert "
                           "! x264enc tune=zerolatency speed-preset=ultrafast bitrate=%u key-int-max=%u bframes=0 "
-                          "byte-stream=true aud=true cabac=false sliced-threads=true rc-lookahead=0 sync-lookahead=0 ref=1 "
+                          "intra-refresh=%s byte-stream=true aud=true cabac=false sliced-threads=true rc-lookahead=0 sync-lookahead=0 ref=1 %s"
                           "! h264parse config-interval=-1 "
                           "! video/x-h264,stream-format=byte-stream,alignment=au,profile=baseline "
                           "! appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true",
@@ -195,7 +214,9 @@ private:
                           height,
                           fps,
                           bitrate_kbps,
-                          fps);
+                          key_int_max,
+                          intra_refresh ? "true" : "false",
+                          option_string);
         }
 
         GError* error = nullptr;
@@ -262,6 +283,12 @@ struct BufferMapping {
 struct LatestFrame {
     std::vector<uint8_t> yuv;
     uint64_t timestamp_ns = 0;
+    uint64_t sequence = 0;
+    bool valid = false;
+};
+
+struct PendingMask {
+    std::vector<uint8_t> data;
     uint64_t sequence = 0;
     bool valid = false;
 };
@@ -578,6 +605,66 @@ uint64_t abs_diff_u64(uint64_t a, uint64_t b)
     return a > b ? a - b : b - a;
 }
 
+int send_frame_with_optional_mask(MpsUdpSender* sender,
+                                  const uint8_t* frame_data,
+                                  size_t frame_size,
+                                  const uint8_t* mask_data,
+                                  size_t mask_size,
+                                  uint32_t mask_width,
+                                  uint32_t mask_height,
+                                  uint32_t mask_stride,
+                                  uint64_t frame_sequence,
+                                  uint64_t capture_timestamp_ns,
+                                  uint32_t flags,
+                                  bool enable_fec,
+                                  std::vector<uint8_t>* envelope_storage)
+{
+    const uint8_t* payload_data = frame_data;
+    size_t payload_size = frame_size;
+    uint32_t send_flags = flags;
+
+    if (mask_data && mask_size > 0u) {
+        size_t envelope_size = 0;
+        int rc;
+
+        if (!envelope_storage) {
+            return -10;
+        }
+        envelope_storage->resize(mps_frame_envelope_required_size(frame_size, mask_size));
+        rc = mps_frame_envelope_write(frame_data,
+                                      frame_size,
+                                      mask_data,
+                                      mask_size,
+                                      mask_width,
+                                      mask_height,
+                                      mask_stride,
+                                      envelope_storage->data(),
+                                      envelope_storage->size(),
+                                      &envelope_size);
+        if (rc != 0) {
+            return rc;
+        }
+        envelope_storage->resize(envelope_size);
+        payload_data = envelope_storage->data();
+        payload_size = envelope_storage->size();
+        send_flags |= MPS_PACKET_FLAG_FRAME_ENVELOPE | MPS_PACKET_FLAG_MASK_PRESENT;
+    }
+
+    return enable_fec
+        ? mps_udp_sender_send_frame_xor_fec(sender,
+                                            payload_data,
+                                            payload_size,
+                                            frame_sequence,
+                                            capture_timestamp_ns,
+                                            send_flags)
+        : mps_udp_sender_send_frame(sender,
+                                    payload_data,
+                                    payload_size,
+                                    frame_sequence,
+                                    capture_timestamp_ns,
+                                    send_flags);
+}
+
 } // namespace
 
 int main(int argc, char** argv)
@@ -593,11 +680,20 @@ int main(int argc, char** argv)
     const std::string codec = argc > 9 ? argv[9] : "raw";
     const uint32_t bitrate_kbps = argc > 10 ? static_cast<uint32_t>(std::atoi(argv[10])) : 8000u;
     const std::string encoder_mode = argc > 11 ? argv[11] : "auto";
+    const bool use_h264 = codec == "h264" || codec == "H264";
     const uint32_t max_pending_frames = argc > 12 ? static_cast<uint32_t>(std::atoi(argv[12])) : 1u;
     const uint64_t max_encode_age_ns = argc > 13
         ? static_cast<uint64_t>(std::strtoull(argv[13], nullptr, 10)) * 1000000ull
         : (fps ? 3000000000ull / static_cast<uint64_t>(fps) : 100000000ull);
-    const bool use_h264 = codec == "h264" || codec == "H264";
+    const bool enable_fec = argc > 14 ? std::atoi(argv[14]) != 0 : false;
+    const bool intra_refresh = argc > 15 ? std::atoi(argv[15]) != 0 : use_h264;
+    const uint32_t slice_max_size = argc > 16 ? static_cast<uint32_t>(std::atoi(argv[16])) : 0u;
+    const bool enable_mask = argc > 17 ? std::atoi(argv[17]) != 0 : false;
+    const bool mask_eye_width_explicit = argc > 18;
+    const bool mask_eye_height_explicit = argc > 19;
+    uint32_t mask_eye_width = mask_eye_width_explicit ? static_cast<uint32_t>(std::atoi(argv[18])) : 0u;
+    uint32_t mask_eye_height = mask_eye_height_explicit ? static_cast<uint32_t>(std::atoi(argv[19])) : 0u;
+    const bool mask_matte_background = argc > 20 ? std::atoi(argv[20]) != 0 : enable_mask;
     const bool prefer_software_encoder = encoder_mode == "software" || encoder_mode == "x264";
     std::mutex notify_mutex;
     std::condition_variable notify_cv;
@@ -606,7 +702,7 @@ int main(int argc, char** argv)
 
     if (eye_width < 160u || eye_height < 120u || (eye_width & 1u) != 0u || (eye_height & 1u) != 0u || fps == 0u) {
         std::fprintf(stderr,
-                     "usage: %s [host] [port] [eye_width] [eye_height] [fps] [left_camera] [right_camera] [max_skew_ms] [raw|h264] [bitrate_kbps] [auto|software] [max_pending_frames] [max_encode_age_ms]\n",
+                     "usage: %s [host] [port] [eye_width] [eye_height] [fps] [left_camera] [right_camera] [max_skew_ms] [raw|h264] [bitrate_kbps] [auto|software] [max_pending_frames] [max_encode_age_ms] [fec 0|1] [intra_refresh 0|1] [slice_max_size] [mask 0|1] [mask_eye_width] [mask_eye_height] [mask_matte_background 0|1]\n",
                      argv[0]);
         return 1;
     }
@@ -652,11 +748,28 @@ int main(int argc, char** argv)
 
     eye_width = left.width();
     eye_height = left.height();
+    if (!mask_eye_width_explicit) {
+        mask_eye_width = eye_width / 4u;
+    }
+    if (!mask_eye_height_explicit) {
+        mask_eye_height = eye_height / 4u;
+    }
+    if (enable_mask && (mask_eye_width == 0u || mask_eye_height == 0u)) {
+        std::fprintf(stderr, "mask dimensions must be non-zero when mask streaming is enabled\n");
+        manager.stop();
+        return 6;
+    }
     const size_t rgba_size = static_cast<size_t>(eye_width) * 2u * eye_height * 4u;
     const size_t sbs_i420_size = static_cast<size_t>(eye_width) * 2u * eye_height * 3u / 2u;
+    const uint32_t mask_sbs_width = mask_eye_width * 2u;
+    const size_t mask_sbs_size = enable_mask ? static_cast<size_t>(mask_sbs_width) * mask_eye_height : 0u;
     std::vector<uint8_t> sbs_rgba(rgba_size);
     std::vector<uint8_t> sbs_i420(use_h264 ? sbs_i420_size : 0u);
+    std::vector<uint8_t> sbs_mask(mask_sbs_size);
     std::vector<uint8_t> encoded_frame;
+    std::vector<uint8_t> envelope_frame;
+    std::vector<PendingMask> pending_masks(MPS_LATENCY_GATE_TRACKED_FRAMES);
+    MpsI420GreenbackMaskConfig mask_config = mps_i420_greenback_mask_config_default();
     LatestFrame left_frame;
     LatestFrame right_frame;
     left_frame.yuv.resize(left.yuv_size());
@@ -672,7 +785,13 @@ int main(int argc, char** argv)
 #if defined(MPS_ENABLE_GSTREAMER)
     H264Encoder encoder;
     if (use_h264) {
-        rc = encoder.init(eye_width * 2u, eye_height, fps, bitrate_kbps, prefer_software_encoder);
+        rc = encoder.init(eye_width * 2u,
+                          eye_height,
+                          fps,
+                          bitrate_kbps,
+                          prefer_software_encoder,
+                          intra_refresh,
+                          slice_max_size);
         if (rc != 0) {
             std::fprintf(stderr, "H.264 encoder init failed: %d\n", rc);
             manager.stop();
@@ -695,7 +814,7 @@ int main(int argc, char** argv)
     }
 
     std::fprintf(stderr,
-                 "streaming libcamera SBS to %s:%u left=%u right=%u eye=%ux%u sbs=%ux%u target_fps=%u max_skew_ms=%llu%s\n",
+                 "streaming libcamera SBS to %s:%u left=%u right=%u eye=%ux%u sbs=%ux%u target_fps=%u max_skew_ms=%llu%s mask=%d mask_sbs=%ux%u matte_background=%d\n",
                  host,
                  port,
                  left_camera,
@@ -706,16 +825,23 @@ int main(int argc, char** argv)
                  eye_height,
                  fps,
                  static_cast<unsigned long long>(max_skew_ns / 1000000ull),
-                 mono_fallback ? " mono_fallback=1" : "");
+                 mono_fallback ? " mono_fallback=1" : "",
+                 enable_mask ? 1 : 0,
+                 mask_sbs_width,
+                 mask_eye_height,
+                 mask_matte_background ? 1 : 0);
     if (use_h264) {
         std::fprintf(stderr,
-                     "codec=h264 bitrate_kbps=%u encoder_mode=%s max_pending=%u max_encode_age_ms=%llu\n",
+                     "codec=h264 bitrate_kbps=%u encoder_mode=%s max_pending=%u max_encode_age_ms=%llu fec=%d intra_refresh=%d slice_max_size=%u\n",
                      bitrate_kbps,
                      encoder_mode.c_str(),
                      max_pending_frames,
-                     static_cast<unsigned long long>(max_encode_age_ns / 1000000ull));
+                     static_cast<unsigned long long>(max_encode_age_ns / 1000000ull),
+                     enable_fec ? 1 : 0,
+                     intra_refresh ? 1 : 0,
+                     slice_max_size);
     } else {
-        std::fprintf(stderr, "codec=raw_rgba\n");
+        std::fprintf(stderr, "codec=raw_rgba fec=%d\n", enable_fec ? 1 : 0);
     }
 
     uint64_t sent_sequence = 0;
@@ -735,15 +861,32 @@ int main(int argc, char** argv)
         while (encoder.pullFrame(&encoded_frame)) {
             const uint64_t capture_timestamp_ns =
                 mps_latency_gate_mark_emitted(&latency_gate, sent_sequence, now_ns());
-            const int send_rc = mps_udp_sender_send_frame(&sender,
-                                                          encoded_frame.data(),
-                                                          encoded_frame.size(),
-                                                          sent_sequence,
-                                                          capture_timestamp_ns,
-                                                          MPS_PACKET_FLAG_KEYFRAME);
+            const PendingMask* mask = nullptr;
+            if (enable_mask) {
+                PendingMask& pending_mask = pending_masks[sent_sequence % pending_masks.size()];
+                if (pending_mask.valid && pending_mask.sequence == sent_sequence) {
+                    mask = &pending_mask;
+                }
+            }
+            const int send_rc = send_frame_with_optional_mask(&sender,
+                                                              encoded_frame.data(),
+                                                              encoded_frame.size(),
+                                                              mask ? mask->data.data() : nullptr,
+                                                              mask ? mask->data.size() : 0u,
+                                                              mask_sbs_width,
+                                                              mask_eye_height,
+                                                              mask_sbs_width,
+                                                              sent_sequence,
+                                                              capture_timestamp_ns,
+                                                              MPS_PACKET_FLAG_KEYFRAME,
+                                                              enable_fec,
+                                                              &envelope_frame);
             if (send_rc != 0) {
                 std::fprintf(stderr, "send failed: %d\n", send_rc);
                 return send_rc;
+            }
+            if (mask) {
+                pending_masks[sent_sequence % pending_masks.size()].valid = false;
             }
             encoded_packets += 1u;
             encoded_bytes += encoded_frame.size();
@@ -811,6 +954,42 @@ int main(int argc, char** argv)
                 std::fprintf(stderr, "SBS I420 pack failed: %d\n", rc);
                 break;
             }
+            if (enable_mask) {
+                PendingMask& pending_mask = pending_masks[encode_sequence % pending_masks.size()];
+                pending_mask.data.resize(mask_sbs_size);
+                rc = mps_i420_greenback_foreground_mask_sbs_r8(left_frame.yuv.data(),
+                                                               right_frame.yuv.data(),
+                                                               eye_width,
+                                                               eye_height,
+                                                               mask_eye_width,
+                                                               mask_eye_height,
+                                                               pending_mask.data.data(),
+                                                               mask_sbs_width,
+                                                               &mask_config);
+                if (rc != 0) {
+                    std::fprintf(stderr, "foreground mask generation failed: %d\n", rc);
+                    break;
+                }
+                pending_mask.sequence = encode_sequence;
+                pending_mask.valid = true;
+                if (mask_matte_background) {
+                    rc = mps_i420_apply_sbs_r8_foreground_matte(sbs_i420.data(),
+                                                                 eye_width * 2u,
+                                                                 eye_height,
+                                                                 pending_mask.data.data(),
+                                                                 mask_sbs_width,
+                                                                 mask_eye_height,
+                                                                 mask_sbs_width,
+                                                                 128u,
+                                                                 16u,
+                                                                 128u,
+                                                                 128u);
+                    if (rc != 0) {
+                        std::fprintf(stderr, "foreground matte application failed: %d\n", rc);
+                        break;
+                    }
+                }
+            }
             rc = encoder.pushFrame(sbs_i420.data(), sbs_i420.size(), encode_sequence);
             if (rc != 0) {
                 std::fprintf(stderr, "encoder push failed: %d\n", rc);
@@ -827,12 +1006,35 @@ int main(int argc, char** argv)
             yuv420_eye_to_rgba_sbs(left_frame.yuv.data(), sbs_rgba.data(), eye_width, eye_height, 0u);
             yuv420_eye_to_rgba_sbs(right_frame.yuv.data(), sbs_rgba.data(), eye_width, eye_height, eye_width);
 
-            rc = mps_udp_sender_send_frame(&sender,
-                                           sbs_rgba.data(),
-                                           sbs_rgba.size(),
-                                           sent_sequence,
-                                           left_frame.timestamp_ns ? left_frame.timestamp_ns : now_ns(),
-                                           MPS_PACKET_FLAG_RAW_RGBA | MPS_PACKET_FLAG_KEYFRAME);
+            if (enable_mask) {
+                rc = mps_i420_greenback_foreground_mask_sbs_r8(left_frame.yuv.data(),
+                                                               right_frame.yuv.data(),
+                                                               eye_width,
+                                                               eye_height,
+                                                               mask_eye_width,
+                                                               mask_eye_height,
+                                                               sbs_mask.data(),
+                                                               mask_sbs_width,
+                                                               &mask_config);
+                if (rc != 0) {
+                    std::fprintf(stderr, "foreground mask generation failed: %d\n", rc);
+                    break;
+                }
+            }
+
+            rc = send_frame_with_optional_mask(&sender,
+                                               sbs_rgba.data(),
+                                               sbs_rgba.size(),
+                                               enable_mask ? sbs_mask.data() : nullptr,
+                                               enable_mask ? sbs_mask.size() : 0u,
+                                               mask_sbs_width,
+                                               mask_eye_height,
+                                               mask_sbs_width,
+                                               sent_sequence,
+                                               left_frame.timestamp_ns ? left_frame.timestamp_ns : now_ns(),
+                                               MPS_PACKET_FLAG_RAW_RGBA | MPS_PACKET_FLAG_KEYFRAME,
+                                               enable_fec,
+                                               &envelope_frame);
             if (rc != 0) {
                 std::fprintf(stderr, "send failed: %d\n", rc);
                 break;

@@ -59,6 +59,48 @@ int mps_packet_writer_make(const MpsPacketWriter* writer,
         return -3;
     }
 
+    return mps_packet_writer_make_payload(writer,
+                                          frame_sequence,
+                                          capture_timestamp_ns,
+                                          flags,
+                                          chunk_index,
+                                          chunk_count,
+                                          frame_data + payload_offset,
+                                          payload_size,
+                                          frame_size,
+                                          out_datagram,
+                                          out_capacity,
+                                          out_size);
+}
+
+int mps_packet_writer_make_payload(const MpsPacketWriter* writer,
+                                   uint64_t frame_sequence,
+                                   uint64_t capture_timestamp_ns,
+                                   uint32_t flags,
+                                   uint32_t chunk_index,
+                                   uint32_t chunk_count,
+                                   const uint8_t* payload_data,
+                                   size_t payload_size,
+                                   size_t frame_size,
+                                   uint8_t* out_datagram,
+                                   size_t out_capacity,
+                                   size_t* out_size)
+{
+    if (!writer || !payload_data || !out_datagram || !out_size) {
+        return -1;
+    }
+    if (chunk_count == 0u ||
+        chunk_count > MPS_PACKET_MAX_CHUNKS ||
+        chunk_index >= chunk_count ||
+        payload_size > MPS_PACKET_MAX_PAYLOAD ||
+        frame_size == 0u ||
+        frame_size > 0xffffffffu) {
+        return -2;
+    }
+    if (out_capacity < MPS_PACKET_HEADER_SIZE + payload_size) {
+        return -3;
+    }
+
     memset(out_datagram, 0, MPS_PACKET_HEADER_SIZE);
     mps_write_u32_le(out_datagram + 0, MPS_PACKET_MAGIC);
     mps_write_u16_le(out_datagram + 4, MPS_PACKET_VERSION);
@@ -72,7 +114,7 @@ int mps_packet_writer_make(const MpsPacketWriter* writer,
     mps_write_u32_le(out_datagram + 44, chunk_count);
     mps_write_u32_le(out_datagram + 48, (uint32_t)payload_size);
     mps_write_u32_le(out_datagram + 52, (uint32_t)frame_size);
-    memcpy(out_datagram + MPS_PACKET_HEADER_SIZE, frame_data + payload_offset, payload_size);
+    memcpy(out_datagram + MPS_PACKET_HEADER_SIZE, payload_data, payload_size);
     *out_size = MPS_PACKET_HEADER_SIZE + payload_size;
     return 0;
 }

@@ -25,10 +25,15 @@ int mps_udp_sender_send_frame(MpsUdpSender* sender,
                               uint64_t frame_sequence,
                               uint64_t capture_timestamp_ns,
                               uint32_t flags);
+int mps_udp_sender_send_frame_xor_fec(MpsUdpSender* sender,
+                                      const uint8_t* frame_data,
+                                      size_t frame_size,
+                                      uint64_t frame_sequence,
+                                      uint64_t capture_timestamp_ns,
+                                      uint32_t flags);
 
 #ifdef __cplusplus
 }
 #endif
 
 #endif
-
