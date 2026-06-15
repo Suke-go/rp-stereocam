@@ -34,11 +34,37 @@ add_executable(mps_pcvr_test_sender
 target_link_libraries(mps_pcvr_test_sender PRIVATE metapuppet_stream_sender)
 
 if(UNIX AND NOT APPLE)
+    if(NOT TARGET imt)
+        add_subdirectory(
+            ${CMAKE_CURRENT_SOURCE_DIR}/../imt
+            ${CMAKE_CURRENT_BINARY_DIR}/imt
+        )
+    endif()
+
     add_executable(mps_rpicam_sbs_sender
         src/mps_rpicam_sbs_sender.c
     )
 
     target_link_libraries(mps_rpicam_sbs_sender PRIVATE metapuppet_stream_sender)
+
+    add_executable(mps_imt_rpicam_sbs_sender
+        src/mps_imt_rpicam_sbs_sender.c
+    )
+    set_target_properties(mps_imt_rpicam_sbs_sender PROPERTIES
+        C_STANDARD 99
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS OFF
+    )
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(mps_imt_rpicam_sbs_sender PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+
+    target_link_libraries(mps_imt_rpicam_sbs_sender
+        PRIVATE
+            metapuppet_stream_sender
+            imt
+            pthread
+    )
 
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBCAMERA REQUIRED IMPORTED_TARGET libcamera)
