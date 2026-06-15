@@ -7,6 +7,9 @@
 #endif
 
 #include "imt.h"
+#ifdef MPS_RVM_ENABLED
+#include "mps_rvm_importance.h"
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -329,6 +332,15 @@ int main(int argc, char** argv)
         return 3;
     }
     imt_map_fill(&map, 128u);
+#ifdef MPS_RVM_ENABLED
+    MpsRvmCtx* rvm = NULL;
+    {
+        const char* rvm_model = getenv("RVM_MODEL");
+        if (!rvm_model) rvm_model = "/home/admin/MetaPuppet/models/rvm_mobilenetv3_fp32.onnx";
+        rvm = mps_rvm_init(rvm_model, eye_w, eye_h);
+        if (!rvm) fprintf(stderr, "RVM init failed – using uniform importance map\n");
+    }
+#endif
 
     ImtPacketizer pkt;
     if (imt_packetizer_init(&pkt, 0, 0) != 0) {
@@ -414,6 +426,12 @@ int main(int argc, char** argv)
 
         yuv420_to_rgba_sbs(left_yuv,  sbs_rgba, eye_w, eye_h, 0u,    left_xform);
         yuv420_to_rgba_sbs(right_yuv, sbs_rgba, eye_w, eye_h, eye_w, right_xform);
+#ifdef MPS_RVM_ENABLED
+        if (rvm) {
+            mps_rvm_update_map(rvm, left_yuv,  (uint32_t)yuv_size, &map, 0u);
+            mps_rvm_update_map(rvm, right_yuv, (uint32_t)yuv_size, &map, eye_w);
+        }
+#endif
 
         {
             const uint64_t capture_timestamp_ns = now_ns();
@@ -444,6 +462,9 @@ int main(int argc, char** argv)
     if (feedback_started) {
         feedback_state_stop(&feedback, feedback_tid);
     }
+#ifdef MPS_RVM_ENABLED
+    if (rvm) mps_rvm_destroy(rvm);
+#endif
     pclose(left_pipe);
     pclose(right_pipe);
     close(ctx.fd);

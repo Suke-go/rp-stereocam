@@ -85,6 +85,32 @@ if(UNIX AND NOT APPLE)
             pthread
     )
     target_compile_definitions(mps_libcamera_sbs_sender PRIVATE MPS_ENABLE_GSTREAMER=1)
+
+    # ── RVM / ONNX Runtime (optional) ──────────────────────────────────────
+    option(MPS_ENABLE_RVM "Enable RVM person segmentation via ONNX Runtime" OFF)
+
+    if(MPS_ENABLE_RVM)
+        if(NOT DEFINED ONNXRUNTIME_ROOT)
+            set(ONNXRUNTIME_ROOT "/usr/local" CACHE PATH "ONNX Runtime install prefix")
+        endif()
+        find_library(ORT_LIB onnxruntime
+            PATHS "${ONNXRUNTIME_ROOT}/lib" NO_DEFAULT_PATH)
+        find_path(ORT_INC onnxruntime_c_api.h
+            PATHS "${ONNXRUNTIME_ROOT}/include" "${ONNXRUNTIME_ROOT}/include/onnxruntime"
+            NO_DEFAULT_PATH)
+        if(ORT_LIB AND ORT_INC)
+            message(STATUS "RVM enabled: ${ORT_LIB}")
+            target_sources(mps_imt_rpicam_sbs_sender PRIVATE
+                src/mps_rvm_importance.c)
+            target_include_directories(mps_imt_rpicam_sbs_sender PRIVATE
+                include "${ORT_INC}")
+            target_link_libraries(mps_imt_rpicam_sbs_sender PRIVATE "${ORT_LIB}" m)
+            target_compile_definitions(mps_imt_rpicam_sbs_sender PRIVATE
+                MPS_RVM_ENABLED=1)
+        else()
+            message(WARNING "MPS_ENABLE_RVM=ON but ONNX Runtime not found at ${ONNXRUNTIME_ROOT}")
+        endif()
+    endif()
 endif()
 
 if(WIN32)
