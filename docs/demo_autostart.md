@@ -36,6 +36,38 @@ Recommended addressing:
 
 ## Camera Pi
 
+First pull this branch onto the camera Pi. This is required until the branch is merged into `main`.
+
+If the branch does not exist locally yet:
+
+```sh
+cd /home/pi/MetaPuppet
+git fetch origin
+git switch -c codex-integrated-demo-dashboard origin/codex-integrated-demo-dashboard
+```
+
+If the branch already exists locally:
+
+```sh
+cd /home/pi/MetaPuppet
+git fetch origin
+git switch codex-integrated-demo-dashboard
+git pull
+```
+
+Confirm the expected commit is present:
+
+```sh
+git log -1 --oneline
+```
+
+Expected branch/commit:
+
+```text
+codex-integrated-demo-dashboard
+1ed5dbe Add integrated camera and motor demo dashboard
+```
+
 Install Flask if needed:
 
 ```sh
@@ -135,8 +167,9 @@ The dashboard is intentionally tolerant of missing hardware: if the sender binar
 
 ## Tomorrow's first checks
 
-1. On the camera Pi, confirm the repo path is actually `/home/pi/MetaPuppet`.
-2. Confirm the sender binary path:
+1. On the camera Pi, pull or switch to `codex-integrated-demo-dashboard`.
+2. Confirm the repo path is actually `/home/pi/MetaPuppet`.
+3. Confirm the sender binary path:
 
 ```sh
 ls -l /home/pi/MetaPuppet/build/mps_imt_rpicam_sbs_sender
@@ -144,14 +177,14 @@ ls -l /home/pi/MetaPuppet/build/mps_imt_rpicam_sbs_sender
 
 If the binary lives elsewhere, set `MP_SENDER_BIN` in the camera systemd unit.
 
-3. Confirm the wired demo IPs:
+4. Confirm the wired demo IPs:
 
 ```sh
 ip addr show eth0
 ping -c 2 192.168.50.1
 ```
 
-4. Confirm Tailscale and the dashboard can coexist:
+5. Confirm Tailscale and the dashboard can coexist:
 
 ```sh
 ip addr show tailscale0
@@ -159,13 +192,13 @@ tailscale ip -4
 curl http://127.0.0.1:7000/api/status
 ```
 
-5. Confirm the integrated motor proxy:
+6. Confirm the integrated motor proxy:
 
 ```sh
 curl http://127.0.0.1:7000/api/motor/status
 ```
 
-6. From the PC browser, open both paths if available:
+7. From the PC browser, open both paths if available:
 
 ```text
 http://192.168.50.2:7000
