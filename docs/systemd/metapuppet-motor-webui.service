@@ -1,0 +1,15 @@
+[Unit]
+Description=MetaPuppet motor Web UI
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi
+ExecStart=/usr/bin/python3 -u /home/pi/pi_motor_webui.py --web-port 8080 --servo-ids 5,6 --control-mode pd --counts-per-cm 435 --center-offset-counts -500 --monitor-interval 1.0 --min-jog-ms 120 --min-command-speed 600 --pd-kp 6.0 --pd-kd 0.15 --pd-accel-limit 20000 --camera-host 192.168.137.2
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

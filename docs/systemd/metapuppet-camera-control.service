@@ -1,0 +1,20 @@
+[Unit]
+Description=MetaPuppet camera control dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/MetaPuppet
+EnvironmentFile=-/home/pi/MetaPuppet/tools/metapuppet_pi.env
+Environment=MP_PI_IP=192.168.50.2
+Environment=MP_MOTOR_BASE_URL=http://100.65.206.21:8080
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+ExecStart=/usr/bin/python3 -u /home/pi/MetaPuppet/tools/mp_control.py --host 0.0.0.0 --port 7000 --motor-base-url ${MP_MOTOR_BASE_URL}
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -9,9 +9,12 @@ pip install flask   (一度だけ)
 
 import base64
 import json
+import os
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 try:
@@ -20,13 +23,14 @@ except ImportError:
     print("Flask が必要です: pip install flask")
     raise
 
-SENDER_BIN = Path.home() / "MetaPuppet/build/mps_imt_rpicam_sbs_sender"
+SENDER_BIN = Path(os.environ.get("MP_SENDER_BIN", str(Path.home() / "MetaPuppet/build/mps_imt_rpicam_sbs_sender")))
 LOG_FILE   = Path("/tmp/mp_sender.log")
+MOTOR_BASE_URL = os.environ.get("MP_MOTOR_BASE_URL", "http://100.65.206.21:8080").rstrip("/")
 
 # Network config (edit if your addresses differ)
-PI_IP  = "192.168.137.2"
-PC_IP  = "192.168.137.1"
-ETH_IF = "eth0"
+PI_IP  = os.environ.get("MP_PI_IP", os.environ.get("METAPUPPET_PI_IP", "192.168.137.2"))
+PC_IP  = os.environ.get("MP_PC_IP", os.environ.get("METAPUPPET_PC_HOST", "192.168.137.1"))
+ETH_IF = os.environ.get("MP_ETH_IF", "eth0")
 
 app = Flask(__name__)
 _proc: subprocess.Popen | None = None
@@ -54,10 +58,13 @@ def eth0_has_ip() -> bool:
 def fix_eth0() -> str:
     if eth0_has_ip():
         return "already ok"
-    _run(["sudo", "ip", "link", "set", ETH_IF, "up"])
-    ok, out = _run(["sudo", "ip", "addr", "add", f"{PI_IP}/24", "dev", ETH_IF])
+    ok_link, link_out = _run(["ip", "link", "set", ETH_IF, "up"])
+    ok, out = _run(["ip", "addr", "add", f"{PI_IP}/24", "dev", ETH_IF])
+    if not ok and "Operation not permitted" in out:
+        ok_link, link_out = _run(["sudo", "-n", "ip", "link", "set", ETH_IF, "up"])
+        ok, out = _run(["sudo", "-n", "ip", "addr", "add", f"{PI_IP}/24", "dev", ETH_IF])
     if not ok and "exists" not in out:
-        return f"failed: {out}"
+        return f"failed: {link_out} {out}".strip()
     return "fixed"
 
 def ping_pc() -> bool:
@@ -112,6 +119,8 @@ def proc_running() -> bool:
 def start_sender(p: dict) -> int:
     global _proc, _last_params
     _last_params = p
+    if not SENDER_BIN.exists():
+        raise FileNotFoundError(f"sender binary not found: {SENDER_BIN}")
     args = [
         str(SENDER_BIN),
         p.get("host", "192.168.137.1"),
@@ -176,13 +185,60 @@ def api_status():
 
 @app.post("/api/start")
 def api_start():
-    pid = start_sender(request.get_json(force=True) or {})
-    return jsonify({"ok": True, "pid": pid})
+    try:
+        pid = start_sender(request.get_json(force=True) or {})
+        return jsonify({"ok": True, "pid": pid})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 @app.post("/api/stop")
 def api_stop():
     stop_sender()
     return jsonify({"ok": True})
+
+
+# ── Motor Pi proxy ────────────────────────────────────────────────────────────
+
+def _motor_request(path: str, method: str = "GET", payload: dict | None = None, timeout: float = 3.0):
+    url = f"{MOTOR_BASE_URL}{path}"
+    data = None
+    headers = {}
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            body = res.read().decode("utf-8", errors="replace")
+            try:
+                parsed = json.loads(body)
+            except json.JSONDecodeError:
+                parsed = {"raw": body}
+            return res.status, parsed
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            parsed = {"error": body or str(e)}
+        return e.code, parsed
+    except Exception as e:
+        return 503, {"ok": False, "error": str(e), "base_url": MOTOR_BASE_URL}
+
+@app.get("/api/motor/status")
+def api_motor_status():
+    code, data = _motor_request("/api/status")
+    if isinstance(data, dict):
+        data.setdefault("base_url", MOTOR_BASE_URL)
+    return jsonify(data), code
+
+@app.post("/api/motor/<action>")
+def api_motor_action(action: str):
+    if action not in {"config", "jog", "calibrate", "stop", "udp"}:
+        return jsonify({"ok": False, "error": f"unsupported motor action: {action}"}), 404
+    payload = request.get_json(force=True, silent=True) or {}
+    code, data = _motor_request(f"/api/{action}", "POST", payload)
+    return jsonify(data), code
 
 @app.get("/api/cameras")
 def api_cameras():
@@ -572,6 +628,12 @@ button{padding:6px 14px;border-radius:4px;border:none;cursor:pointer;font-family
      color:#0d0;white-space:pre-wrap;word-break:break-all;line-height:1.4}
 .sec{color:#666;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin:10px 0 4px}
 .cmd{color:#555;font-size:10px;margin-top:6px;word-break:break-all}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:8px}
+.metric{background:#111;border:1px solid #242424;border-radius:4px;padding:8px}
+.metric .value{color:#ddd;font-size:16px;margin-top:3px}
+table{width:100%;border-collapse:collapse;font-size:11px}
+th,td{border-bottom:1px solid #242424;padding:5px;text-align:right}
+th:first-child,td:first-child{text-align:left}
 </style>
 </head>
 <body>
@@ -670,6 +732,54 @@ button{padding:6px 14px;border-radius:4px;border:none;cursor:pointer;font-family
     <div id="health0" style="font-size:12px;padding:6px 10px;background:#1a1a1a;border-radius:4px;border:1px solid #2a2a2a">cam0 —</div>
     <div id="health1" style="font-size:12px;padding:6px 10px;background:#1a1a1a;border-radius:4px;border:1px solid #2a2a2a">cam1 —</div>
   </div>
+</div>
+
+<div class="card">
+  <div class="row" style="margin-bottom:6px">
+    <span class="sec" style="margin:0">Motor Pi</span>
+    <span id="motor-base" style="color:#555;font-size:10px"></span>
+    <button class="btn-sm" onclick="motorRefresh()" style="margin-left:auto;font-size:11px">⟳ Refresh</button>
+  </div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+    <div id="motor-pill" class="badge stopped" style="font-size:11px">Motor —</div>
+    <div id="motor-udp-pill" class="badge stopped" style="font-size:11px">UDP —</div>
+    <div id="motor-camera-pill" class="badge stopped" style="font-size:11px">Camera link —</div>
+  </div>
+  <div class="grid">
+    <div class="metric"><div class="sec" style="margin:0">UDP packets</div><div id="motor-udp-packets" class="value">-</div></div>
+    <div class="metric"><div class="sec" style="margin:0">Last delta</div><div id="motor-delta" class="value">-</div></div>
+    <div class="metric"><div class="sec" style="margin:0">PD speed</div><div id="motor-pd-speed" class="value">-</div></div>
+    <div class="metric"><div class="sec" style="margin:0">Camera host</div><div id="motor-camera-host" class="value">-</div></div>
+  </div>
+  <div class="row" style="gap:5px;margin-top:8px">
+    <button class="btn-sm" onclick="motorUdp(true)">UDP On</button>
+    <button class="btn-sm" onclick="motorUdp(false)">UDP Off</button>
+    <button class="btn-stop" onclick="motorStop()">Stop All</button>
+    <button class="btn-start" onclick="motorCalibrate()">Set Initial</button>
+  </div>
+  <div class="row" style="gap:5px">
+    <label>Servo</label>
+    <select id="motor-servo" style="width:80px"><option value="5">ID 5</option><option value="6">ID 6</option></select>
+    <label>Step mm</label><input type="number" id="motor-step" value="1" step="0.5" style="width:70px">
+    <label style="min-width:40px"><input id="motor-both" type="checkbox" checked style="width:auto"> both</label>
+    <button class="btn-sm" onclick="motorJog(-1)">↓ Jog</button>
+    <button class="btn-sm" onclick="motorJog(1)">↑ Jog</button>
+    <button class="btn-sm" onclick="motorStopSelected()">Stop ID</button>
+  </div>
+  <div class="row" style="gap:5px">
+    <label>mode</label><select id="motor-mode" style="width:96px"><option value="pd">pd</option><option value="relative">relative</option></select>
+    <label>counts/cm</label><input type="number" id="motor-counts" value="435" style="width:70px">
+    <label>Kp</label><input type="number" id="motor-kp" value="6.0" step="0.1" style="width:58px">
+    <label>Kd</label><input type="number" id="motor-kd" value="0.15" step="0.01" style="width:58px">
+    <button class="btn-sm" onclick="motorApplyConfig()">Apply</button>
+  </div>
+  <div style="overflow-x:auto;margin-top:8px">
+    <table>
+      <thead><tr><th>ID</th><th>pos</th><th>target</th><th>initial</th><th>speed</th><th>torque</th><th>ok</th></tr></thead>
+      <tbody id="motor-rows"><tr><td colspan="7">-</td></tr></tbody>
+    </table>
+  </div>
+  <div class="log" id="motor-log" style="height:90px;margin-top:8px"></div>
 </div>
 
 <div class="card">
@@ -783,7 +893,11 @@ function updatePreview(){
 applyResPreset(); updatePreview();
 
 async function ctrlStart(){
-  await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(params())});
+  const r=await fetch('/api/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(params())});
+  if(!r.ok){
+    const d=await r.json().catch(()=>({error:'start failed'}));
+    const el=$('log'); el.textContent+='[start error] '+(d.error||JSON.stringify(d))+'\n'; el.scrollTop=el.scrollHeight;
+  }
 }
 async function ctrlStop(){await fetch('/api/stop',{method:'POST'});}
 async function ctrlRestart(){await ctrlStop();setTimeout(ctrlStart,600);}
@@ -813,6 +927,70 @@ async function checkCameras(){
   }catch(e){$('cam-list').textContent='Error: '+e;}
   btn.disabled=false; btn.textContent='🔍 Check';
 }
+
+// Motor Pi
+function motorBadge(id, ok, label){
+  const el=$(id); el.textContent=label; el.className='badge '+(ok?'running':'stopped');
+}
+function motorLog(msg){ const el=$('motor-log'); el.textContent+=msg+'\n'; el.scrollTop=el.scrollHeight; }
+async function motorApi(path, body){
+  const opts=body===undefined ? {} : {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)};
+  const r=await fetch('/api/motor/'+path, opts);
+  const d=await r.json().catch(()=>({ok:false,error:'invalid response'}));
+  if(!r.ok) throw new Error(d.error || JSON.stringify(d));
+  return d;
+}
+function renderMotor(s){
+  $('motor-base').textContent=s.base_url ? s.base_url : '';
+  motorBadge('motor-pill', !!(s.motor&&s.motor.ok), 'Motor '+((s.motor&&s.motor.ok)?'✓':'✗'));
+  motorBadge('motor-udp-pill', !!(s.udp&&s.udp.enabled), 'UDP '+((s.udp&&s.udp.enabled)?'on':'off'));
+  motorBadge('motor-camera-pill', !!(s.camera&&s.camera.ok), 'Camera link '+((s.camera&&s.camera.ok)?'✓':'✗'));
+  $('motor-udp-packets').textContent=s.udp ? (s.udp.packets ?? '-') : '-';
+  $('motor-delta').textContent=s.udp && s.udp.last_delta_counts!==null ? s.udp.last_delta_counts+' ct' : '-';
+  $('motor-pd-speed').textContent=s.udp && s.udp.pd_speed!==null ? s.udp.pd_speed : '-';
+  $('motor-camera-host').textContent=s.camera ? (s.camera.host || '-') : '-';
+  if(s.config){
+    $('motor-mode').value=s.config.control_mode||'pd';
+    $('motor-counts').value=s.config.counts_per_cm??435;
+    $('motor-kp').value=s.config.pd_kp??6.0;
+    $('motor-kd').value=s.config.pd_kd??0.15;
+  }
+  if(s.servos && s.servos.length){
+    const selectedServo=$('motor-servo').value;
+    $('motor-servo').innerHTML=s.servos.map(m=>`<option value="${m.id}">ID ${m.id}</option>`).join('');
+    if(selectedServo && [...$('motor-servo').options].some(o=>o.value===selectedServo)) $('motor-servo').value=selectedServo;
+    $('motor-rows').innerHTML=s.servos.map(m=>
+      `<tr><td>${m.id}</td><td>${m.position ?? '-'}</td><td>${m.target ?? '-'}</td><td>${m.initial ?? '-'}</td><td>${m.speed ?? '-'}</td><td>${m.torque ?? '-'}</td><td>${m.ok?'OK':'NG'}</td></tr>`
+    ).join('');
+  }
+  if(s.events && s.events.length){
+    $('motor-log').textContent=s.events.slice(-8).join('\n');
+  }
+}
+async function motorRefresh(){
+  try{ renderMotor(await motorApi('status')); }
+  catch(e){
+    motorBadge('motor-pill', false, 'Motor offline');
+    motorLog('[error] '+e.message);
+  }
+}
+async function motorJog(dir){
+  try{
+    await motorApi('jog',{direction:dir,step_mm:+$('motor-step').value,servo_id:+$('motor-servo').value,both:$('motor-both').checked});
+    await motorRefresh();
+  }catch(e){motorLog('[jog error] '+e.message);}
+}
+async function motorStop(){try{await motorApi('stop',{});await motorRefresh();}catch(e){motorLog('[stop error] '+e.message);}}
+async function motorStopSelected(){try{await motorApi('stop',{servo_id:+$('motor-servo').value});await motorRefresh();}catch(e){motorLog('[stop error] '+e.message);}}
+async function motorCalibrate(){try{await motorApi('calibrate',{});await motorRefresh();}catch(e){motorLog('[calibrate error] '+e.message);}}
+async function motorUdp(enabled){try{await motorApi('udp',{enabled});await motorRefresh();}catch(e){motorLog('[udp error] '+e.message);}}
+async function motorApplyConfig(){
+  try{
+    await motorApi('config',{control_mode:$('motor-mode').value,counts_per_cm:+$('motor-counts').value,pd_kp:+$('motor-kp').value,pd_kd:+$('motor-kd').value});
+    await motorRefresh();
+  }catch(e){motorLog('[config error] '+e.message);}
+}
+setInterval(motorRefresh,3000);setTimeout(motorRefresh,500);
 
 // Status polling
 async function poll(){
@@ -1026,6 +1204,9 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="MetaPuppet Pi Control Server")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=7000)
+    ap.add_argument("--motor-base-url", default=MOTOR_BASE_URL)
     a = ap.parse_args()
+    MOTOR_BASE_URL = a.motor_base_url.rstrip("/")
     print(f"MetaPuppet Pi Control  →  http://stereocam.local:{a.port}")
+    print(f"Motor Pi API           →  {MOTOR_BASE_URL}")
     app.run(host=a.host, port=a.port, threaded=True)
