@@ -57,6 +57,28 @@ cmake --build build/pi_stream_sender --target mps_stereo_x264_sender -j4
 ./build/pi_stream_sender/mps_stereo_x264_sender 192.168.137.1 5004 1280 720 60 0 1
 ```
 
+To deploy without overwriting an existing dirty Pi checkout, use the isolated
+SCP helper from Windows. It builds the sender but does not start it:
+
+```powershell
+pwsh tools/deploy_stereo_dual.ps1
+```
+
+Then start the calibrated 60 fps stream on the Pi. Video goes to the direct
+Ethernet PC address `192.168.50.1`, left eye on UDP 5004 and right on 5005:
+
+```bash
+cd /home/admin/MetaPuppet-dual
+./tools/run_stereo_dual.sh 192.168.50.1 5004 1280 720 60 0 1
+```
+
+For exact calibration exposure at 30 fps:
+
+```bash
+MPS_USE_CALIBRATION_EXPOSURE=1 \
+  ./tools/run_stereo_dual.sh 192.168.50.1 5004 1280 720 30 0 1
+```
+
 The low-latency defaults use constrained-baseline H.264, AQ disabled, CRF 20,
 a half-second GOP, six camera buffers, batched UDP sends, and no
 application-level network pacing. A local processing-budget controller raises
