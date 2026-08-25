@@ -66,6 +66,43 @@ if(UNIX AND NOT APPLE)
             pthread
     )
 
+    option(MPS_ENABLE_X264 "Enable H.264 encoding via libx264" OFF)
+    if(MPS_ENABLE_X264)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(X264 REQUIRED x264)
+        target_sources(mps_imt_rpicam_sbs_sender PRIVATE src/mps_x264_encoder.c)
+        target_include_directories(mps_imt_rpicam_sbs_sender PRIVATE ${X264_INCLUDE_DIRS})
+        target_link_libraries(mps_imt_rpicam_sbs_sender PRIVATE ${X264_LIBRARIES})
+        target_compile_definitions(mps_imt_rpicam_sbs_sender PRIVATE MPS_X264_ENABLED=1)
+    endif()
+
+    # ── Dual independent-eye H.264 sender (no SBS, no importance map) ──────
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(X264_STEREO REQUIRED x264)
+
+    add_executable(mps_stereo_x264_sender
+        src/mps_stereo_x264_sender.c
+        src/mps_x264_encoder.c
+    )
+    set_target_properties(mps_stereo_x264_sender PROPERTIES
+        C_STANDARD 99
+        C_STANDARD_REQUIRED ON
+        C_EXTENSIONS OFF
+    )
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(mps_stereo_x264_sender PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+    target_include_directories(mps_stereo_x264_sender PRIVATE
+        ${X264_STEREO_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
+    target_link_libraries(mps_stereo_x264_sender
+        PRIVATE
+            imt
+            pthread
+            ${X264_STEREO_LIBRARIES}
+    )
+
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBCAMERA REQUIRED IMPORTED_TARGET libcamera)
     pkg_check_modules(GSTREAMER REQUIRED IMPORTED_TARGET
@@ -94,9 +131,16 @@ if(UNIX AND NOT APPLE)
             set(ONNXRUNTIME_ROOT "/usr/local" CACHE PATH "ONNX Runtime install prefix")
         endif()
         find_library(ORT_LIB onnxruntime
-            PATHS "${ONNXRUNTIME_ROOT}/lib" NO_DEFAULT_PATH)
+            PATHS "${ONNXRUNTIME_ROOT}/lib"
+                  "${ONNXRUNTIME_ROOT}/lib/aarch64-linux-gnu"
+                  "${ONNXRUNTIME_ROOT}/lib/x86_64-linux-gnu"
+            NO_DEFAULT_PATH)
+        if(NOT ORT_LIB)
+            find_library(ORT_LIB onnxruntime)  # fallback: let CMake search defaults
+        endif()
         find_path(ORT_INC onnxruntime_c_api.h
-            PATHS "${ONNXRUNTIME_ROOT}/include" "${ONNXRUNTIME_ROOT}/include/onnxruntime"
+            PATHS "${ONNXRUNTIME_ROOT}/include"
+                  "${ONNXRUNTIME_ROOT}/include/onnxruntime"
             NO_DEFAULT_PATH)
         if(ORT_LIB AND ORT_INC)
             message(STATUS "RVM enabled: ${ORT_LIB}")
