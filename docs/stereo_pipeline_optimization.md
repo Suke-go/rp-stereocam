@@ -36,6 +36,18 @@ and host queueing-discipline changes are intentionally outside its scope.
   formats in [DXGI_FORMAT](https://learn.microsoft.com/windows/win32/api/dxgiformat/ne-dxgiformat-dxgi_format),
   and Unity accepts an `ID3D11ShaderResourceView*` for
   [CreateExternalTexture](https://docs.unity3d.com/ScriptReference/Texture2D.CreateExternalTexture.html).
+- IMT wire version 1 now defines a header-only `KEYFRAME_NACK` control packet.
+  When a new frame supersedes an incomplete keyframe, the PC sends one NACK to
+  the source address observed by `recvfrom()`. Each Pi eye socket has a receive
+  thread that only validates and publishes the requested sequence; the normal
+  eye worker performs the retry between encode jobs. Only the latest keyframe
+  is retained, it can be retried once, and its retry uses normalized chunk
+  weight 255 throughout (FEC group size 2). Stale, duplicate, oversized, and
+  malformed requests are ignored. The PC assembler gates dependent
+  interframes until the requested sequence or a newer natural keyframe arrives;
+  this is required because plain latest-wins ordering would reject the older
+  retry. A NACK accidentally delivered to an IMT assembler is explicitly
+  ignored without changing active video state.
 
 ## Deliberately not implemented as a local patch
 
@@ -62,7 +74,8 @@ For a target Pi/relay/Quest run, record at least:
 - per-eye capture pairs, capture drops, maximum timestamp skew, encode ms,
   send ms, output FPS, and Mbps;
 - receiver packets dropped, incomplete/recovered frames, decode failures,
-  overwritten frames, pair mismatches, hardware-decoder and GPU-direct flags;
+  overwritten frames, NACK sent/failure counts, pair mismatches,
+  hardware-decoder and GPU-direct flags;
 - receive-to-decode and receive-to-upload percentiles over several minutes;
 - the same scene and camera motion for `rpicam` versus direct `libcamera`, and
   CPU upload versus GPU-direct, changing one variable at a time.
@@ -80,3 +93,11 @@ time was about 7.4-7.6 ms per eye and batched send time about 0.04-0.06 ms.
 The observed one-second maximum timestamp skew was typically about 1.6 ms.
 Three frames were dropped during startup/synchronization. This is a smoke
 result rather than a long-duration thermal or end-to-end Quest benchmark.
+
+The reverse path has two automated smoke layers. IMT unit tests cover the new
+wire type, incomplete-keyframe latch, and assembler control-packet isolation.
+`MetaPuppetVR/tools/stereo_receiver_smoke.py --nack-smoke` injects an
+unrecoverable keyframe on both loopback ports and validates exactly one NACK
+per eye. `tools/stereo_keyframe_nack_smoke.py` is the real-UDP Pi response
+probe; it verifies the repeated sequence uses FEC group size 2 and that a
+duplicate NACK does not cause a second retransmission.

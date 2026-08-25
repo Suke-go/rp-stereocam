@@ -35,6 +35,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/uio.h>
 #include <time.h>
 #include <unistd.h>
@@ -47,6 +48,7 @@
 #define CAPTURE_SLOT_COUNT 3
 #define MPS_SEND_BATCH_DATAGRAMS 16u
 #define MPS_SEND_DATAGRAM_BYTES (IMT_WIRE_HEADER_SIZE + IMT_DEFAULT_MAX_PAYLOAD)
+#define MPS_NACK_RECEIVE_TIMEOUT_MS 100u
 #ifndef SO_MAX_PACING_RATE
 #define SO_MAX_PACING_RATE 47
 #endif
@@ -333,9 +335,110 @@ typedef struct {
     uint64_t last_work_ns;
     uint32_t log_frames;
     uint64_t last_error_ns;
+    /* The NACK thread only publishes a requested sequence. The encode worker
+     * remains the sole owner of pkt, send batching, and keyframe bytes. */
+    pthread_t nack_thread;
+    pthread_mutex_t nack_lock;
+    uint64_t pending_nack_frame_seq;
+    uint64_t nacks_received;
+    uint64_t nack_retries_sent;
+    uint64_t nacks_ignored;
+    uint64_t last_nack_error_ns;
+    int pending_nack;
+    int nack_stop;
+    int nack_lock_ready;
+    int nack_thread_started;
+    uint8_t* last_keyframe_nal;
+    uint8_t* retry_chunk_weights;
+    size_t last_keyframe_capacity;
+    uint32_t last_keyframe_nal_size;
+    uint32_t retry_chunk_capacity;
+    uint64_t last_keyframe_frame_seq;
+    uint64_t last_keyframe_capture_timestamp_ns;
+    uint16_t last_keyframe_flags;
+    uint8_t last_keyframe_retried;
 } EyeStream;
 
 static void eye_stream_destroy(EyeStream* eye);
+
+static int eye_stream_decode_keyframe_nack(const uint8_t* datagram, size_t size,
+                                           uint64_t* out_frame_seq)
+{
+    ImtWireHeader header;
+    if (!datagram || !out_frame_seq || size != IMT_WIRE_HEADER_SIZE ||
+        imt_wire_decode_header(datagram, size, &header) != 0 ||
+        header.type != IMT_PACKET_TYPE_KEYFRAME_NACK ||
+        header.flags != 0u || header.capture_timestamp_ns != 0u ||
+        header.frame_size != 0u || header.chunk_index != 0u ||
+        header.chunk_count != 0u || header.payload_size != 0u ||
+        header.fec_group != 0u || header.fec_group_size != 0u ||
+        header.fec_index != 0u) {
+        return -1;
+    }
+    *out_frame_seq = header.frame_seq;
+    return 0;
+}
+
+static void* eye_stream_nack_loop(void* arg)
+{
+    EyeStream* eye = (EyeStream*)arg;
+    /* One extra byte lets recv() expose oversized datagrams instead of
+     * silently truncating them into an apparently valid 40-byte NACK. */
+    uint8_t datagram[IMT_WIRE_HEADER_SIZE + 1u];
+
+    for (;;) {
+        ssize_t received;
+        uint64_t requested_frame_seq;
+        int stop;
+
+        pthread_mutex_lock(&eye->nack_lock);
+        stop = eye->nack_stop;
+        pthread_mutex_unlock(&eye->nack_lock);
+        if (stop) {
+            break;
+        }
+
+        received = recv(eye->ctx.fd, datagram, sizeof(datagram), 0);
+        if (received < 0) {
+            const int socket_error = errno;
+            if (socket_error == EINTR || socket_error == EAGAIN ||
+                socket_error == EWOULDBLOCK) {
+                continue;
+            }
+            pthread_mutex_lock(&eye->nack_lock);
+            stop = eye->nack_stop;
+            pthread_mutex_unlock(&eye->nack_lock);
+            if (stop) {
+                break;
+            }
+            if (now_ns() - eye->last_nack_error_ns >= 1000000000ull) {
+                fprintf(stderr, "%s: NACK receive failed: %s\n",
+                        eye->label, strerror(socket_error));
+                eye->last_nack_error_ns = now_ns();
+            }
+            continue;
+        }
+        if (eye_stream_decode_keyframe_nack(datagram, (size_t)received,
+                                            &requested_frame_seq) != 0) {
+            continue;
+        }
+
+        pthread_mutex_lock(&eye->nack_lock);
+        if (!eye->nack_stop) {
+            eye->nacks_received += 1u;
+            if (eye->last_keyframe_nal_size != 0u &&
+                eye->last_keyframe_frame_seq == requested_frame_seq &&
+                !eye->last_keyframe_retried) {
+                eye->pending_nack_frame_seq = requested_frame_seq;
+                eye->pending_nack = 1;
+            } else {
+                eye->nacks_ignored += 1u;
+            }
+        }
+        pthread_mutex_unlock(&eye->nack_lock);
+    }
+    return NULL;
+}
 
 static int eye_stream_init(EyeStream* eye, const char* label, const char* host, uint16_t port,
                            uint32_t w, uint32_t h, uint32_t fps, float crf,
@@ -345,6 +448,10 @@ static int eye_stream_init(EyeStream* eye, const char* label, const char* host, 
     memset(eye, 0, sizeof(*eye));
     eye->ctx.fd = -1;
     eye->label = label;
+    if (pthread_mutex_init(&eye->nack_lock, NULL) != 0) {
+        return -1;
+    }
+    eye->nack_lock_ready = 1;
 
     mps_x264_default_options(&x264_options);
     x264_options.keyint = keyint;
@@ -405,6 +512,30 @@ static int eye_stream_init(EyeStream* eye, const char* label, const char* host, 
         eye_stream_destroy(eye);
         return -5;
     }
+    {
+        const char* nack_env = getenv("MPS_KEYFRAME_NACK");
+        const int nack_enabled =
+            !nack_env ||
+            (strcmp(nack_env, "0") != 0 && strcmp(nack_env, "off") != 0 &&
+             strcmp(nack_env, "OFF") != 0);
+        if (nack_enabled) {
+            struct timeval receive_timeout;
+            receive_timeout.tv_sec = 0;
+            receive_timeout.tv_usec = (suseconds_t)MPS_NACK_RECEIVE_TIMEOUT_MS * 1000;
+            if (setsockopt(eye->ctx.fd, SOL_SOCKET, SO_RCVTIMEO,
+                           &receive_timeout, sizeof(receive_timeout)) != 0) {
+                fprintf(stderr, "warning: %s NACK receive timeout failed: %s\n",
+                        label, strerror(errno));
+            }
+            if (pthread_create(&eye->nack_thread, NULL,
+                               eye_stream_nack_loop, eye) != 0) {
+                fprintf(stderr, "%s: NACK thread creation failed\n", label);
+                eye_stream_destroy(eye);
+                return -6;
+            }
+            eye->nack_thread_started = 1;
+        }
+    }
     return 0;
 }
 
@@ -413,15 +544,131 @@ static void eye_stream_destroy(EyeStream* eye)
     if (!eye) {
         return;
     }
+    if (eye->nack_thread_started) {
+        pthread_mutex_lock(&eye->nack_lock);
+        eye->nack_stop = 1;
+        pthread_mutex_unlock(&eye->nack_lock);
+        if (eye->ctx.fd >= 0) {
+            (void)shutdown(eye->ctx.fd, SHUT_RD);
+        }
+        pthread_join(eye->nack_thread, NULL);
+        eye->nack_thread_started = 0;
+    }
+    if (eye->nack_lock_ready && eye->nacks_received != 0u) {
+        fprintf(stderr,
+                "%s: NACK summary received=%llu retransmitted=%llu ignored=%llu\n",
+                eye->label,
+                (unsigned long long)eye->nacks_received,
+                (unsigned long long)eye->nack_retries_sent,
+                (unsigned long long)eye->nacks_ignored);
+    }
     if (eye->ctx.fd >= 0) {
         close(eye->ctx.fd);
     }
+    free(eye->last_keyframe_nal);
+    free(eye->retry_chunk_weights);
     imt_packetizer_destroy(&eye->pkt);
     if (eye->x264) {
         mps_x264_destroy(eye->x264);
     }
+    if (eye->nack_lock_ready) {
+        pthread_mutex_destroy(&eye->nack_lock);
+    }
     memset(eye, 0, sizeof(*eye));
     eye->ctx.fd = -1;
+}
+
+static int eye_stream_cache_keyframe(EyeStream* eye, const uint8_t* nal,
+                                     uint32_t nal_size, uint64_t frame_seq,
+                                     uint64_t capture_timestamp_ns, uint16_t flags)
+{
+    const uint32_t chunk_count =
+        (uint32_t)(((size_t)nal_size + eye->pkt.max_payload - 1u) /
+                   eye->pkt.max_payload);
+    if (eye->last_keyframe_capacity < nal_size) {
+        uint8_t* grown = (uint8_t*)realloc(eye->last_keyframe_nal, nal_size);
+        if (!grown) {
+            pthread_mutex_lock(&eye->nack_lock);
+            eye->last_keyframe_nal_size = 0u;
+            pthread_mutex_unlock(&eye->nack_lock);
+            return -1;
+        }
+        eye->last_keyframe_nal = grown;
+        eye->last_keyframe_capacity = nal_size;
+    }
+    if (eye->retry_chunk_capacity < chunk_count) {
+        uint8_t* grown = (uint8_t*)realloc(eye->retry_chunk_weights, chunk_count);
+        if (!grown) {
+            pthread_mutex_lock(&eye->nack_lock);
+            eye->last_keyframe_nal_size = 0u;
+            pthread_mutex_unlock(&eye->nack_lock);
+            return -1;
+        }
+        eye->retry_chunk_weights = grown;
+        eye->retry_chunk_capacity = chunk_count;
+    }
+    memcpy(eye->last_keyframe_nal, nal, nal_size);
+    memset(eye->retry_chunk_weights, 255, chunk_count);
+    pthread_mutex_lock(&eye->nack_lock);
+    eye->last_keyframe_nal_size = nal_size;
+    eye->last_keyframe_frame_seq = frame_seq;
+    eye->last_keyframe_capture_timestamp_ns = capture_timestamp_ns;
+    eye->last_keyframe_flags = flags;
+    eye->last_keyframe_retried = 0u;
+    pthread_mutex_unlock(&eye->nack_lock);
+    return 0;
+}
+
+static void eye_stream_retry_pending_keyframe(EyeStream* eye)
+{
+    uint64_t requested_frame_seq;
+    int pending;
+    int send_rc;
+    uint32_t chunk_count;
+
+    pthread_mutex_lock(&eye->nack_lock);
+    pending = eye->pending_nack;
+    requested_frame_seq = eye->pending_nack_frame_seq;
+    eye->pending_nack = 0;
+    if (pending && eye->last_keyframe_nal_size != 0u &&
+        eye->last_keyframe_frame_seq == requested_frame_seq &&
+        !eye->last_keyframe_retried) {
+        /* Mark before sending: even a send failure consumes this frame's
+         * single retry and therefore cannot create an infinite loop. */
+        eye->last_keyframe_retried = 1u;
+    } else if (pending) {
+        eye->nacks_ignored += 1u;
+        pending = 0;
+    }
+    pthread_mutex_unlock(&eye->nack_lock);
+    if (!pending) {
+        return;
+    }
+    chunk_count = (uint32_t)(((size_t)eye->last_keyframe_nal_size +
+                              eye->pkt.max_payload - 1u) /
+                             eye->pkt.max_payload);
+    send_rc = imt_packetizer_send_frame(
+        &eye->pkt, eye->last_keyframe_nal, eye->last_keyframe_nal_size,
+        eye->last_keyframe_frame_seq, eye->last_keyframe_capture_timestamp_ns,
+        eye->last_keyframe_flags, eye->retry_chunk_weights, chunk_count,
+        emit_datagram, &eye->ctx);
+    if (send_rc == 0) {
+        send_rc = send_ctx_flush(&eye->ctx);
+    } else {
+        eye->ctx.batch_count = 0u;
+    }
+    if (send_rc == 0) {
+        pthread_mutex_lock(&eye->nack_lock);
+        eye->nack_retries_sent += 1u;
+        pthread_mutex_unlock(&eye->nack_lock);
+        fprintf(stderr,
+                "%s: retransmitted keyframe seq=%llu bytes=%u with FEC group size 2\n",
+                eye->label, (unsigned long long)eye->last_keyframe_frame_seq,
+                eye->last_keyframe_nal_size);
+    } else {
+        fprintf(stderr, "%s: keyframe retransmit seq=%llu failed: %d\n",
+                eye->label, (unsigned long long)requested_frame_seq, send_rc);
+    }
 }
 
 /* Encode one eye's raw I420 buffer and send it as its own IMT frame. No
@@ -445,6 +692,11 @@ static void eye_stream_encode_and_send(EyeStream* eye, const uint8_t* i420,
     }
 
     const uint16_t flags = is_keyframe ? (IMT_PACKET_FLAG_KEYFRAME | IMT_PACKET_FLAG_CODEC_CONFIG) : 0u;
+    if (is_keyframe && eye_stream_cache_keyframe(
+            eye, nal, (uint32_t)nal_size, frame_seq,
+            capture_timestamp_ns, flags) != 0) {
+        fprintf(stderr, "%s: keyframe retry cache allocation failed\n", eye->label);
+    }
     int send_rc = imt_packetizer_send_frame(&eye->pkt, nal, (uint32_t)nal_size,
                                             frame_seq, capture_timestamp_ns,
                                             flags, NULL, 0u, emit_datagram, &eye->ctx);
@@ -529,7 +781,9 @@ static void* eye_worker_loop(void* arg)
         generation = worker->generation;
         pthread_mutex_unlock(&worker->lock);
 
+        eye_stream_retry_pending_keyframe(worker->eye);
         eye_stream_encode_and_send(worker->eye, i420, timestamp_ns, frame_seq);
+        eye_stream_retry_pending_keyframe(worker->eye);
 
         pthread_mutex_lock(&worker->lock);
         worker->completed_generation = generation;
@@ -876,6 +1130,7 @@ int main(int argc, char** argv)
                 "  env MPS_X264_CRF=20, MPS_X264_KEYINT=fps/2, MPS_CAMERA_BUFFERS=6,\n"
                 "      MPS_KERNEL_PACING_MBPS=0, MPS_CAMERA_SYNC=0 to disable software sync,\n"
                 "      MPS_CAPTURE_BACKEND=rpicam|libcamera, MPS_CAMERA_MAX_SKEW_MS=5,\n"
+                "      MPS_KEYFRAME_NACK=1 (set 0 to disable one-shot keyframe retry),\n"
                 "      MPS_ADAPTIVE=1, MPS_ADAPTIVE_TARGET_MS=ceil(1000/fps), "
                 "MPS_ADAPTIVE_CRF_MAX=30\n",
                 argv[0]);

@@ -87,6 +87,25 @@ the effective socket rate; it does not change the host qdisc.
 `MPS_CAMERA_SYNC=0` disables software camera synchronization for diagnostics
 only.
 
+The dual-eye receiver sends one 40-byte `KEYFRAME_NACK` when an incomplete
+keyframe is superseded. The sender retains only its latest keyframe and retries
+that exact sequence once, using FEC group size 2. Retransmission is handled by
+the existing eye worker, so the packetizer and `sendmmsg()` scratch state never
+have concurrent owners. While recovery is pending, the PC drops dependent
+interframes and resumes on the retry or the next natural keyframe; otherwise a
+same-sequence retry would be rejected by latest-wins ordering. Set
+`MPS_KEYFRAME_NACK=0` and disable Unity's `Enable Keyframe Retry` together for
+an A/B comparison.
+The PC diagnostics window exposes per-eye `nack` and `nackFail` counters.
+
+To verify the Pi response independently of the decoder, run the probe on the
+destination PC, then start the Pi sender against that PC and port pair:
+
+```bash
+python tools/stereo_keyframe_nack_smoke.py --port 55004
+./build/pi_stream_sender/mps_stereo_x264_sender <pc-ip> 55004 1280 720 60 0 1
+```
+
 ## Repository layout
 
 Use this repository for Pi-side camera and transport work.

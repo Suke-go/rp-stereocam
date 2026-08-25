@@ -109,6 +109,19 @@ void imt_assembler_destroy(ImtAssembler* assembler)
     memset(assembler, 0, sizeof(*assembler));
 }
 
+int imt_assembler_set_keyframe_retry_enabled(ImtAssembler* assembler, int enabled)
+{
+    if (!assembler || !assembler->staging) {
+        return -1;
+    }
+    assembler->keyframe_retry_enabled = enabled ? 1u : 0u;
+    if (!enabled) {
+        assembler->keyframe_retry_pending = 0u;
+        assembler->keyframe_retry_frame_seq = 0u;
+    }
+    return 0;
+}
+
 static int imt_assembler_start_frame(ImtAssembler* assembler, const ImtWireHeader* header)
 {
     const uint32_t expected_chunks =
@@ -160,6 +173,11 @@ static int imt_assembler_publish(ImtAssembler* assembler)
     assembler->latest.keyframe = assembler->active_keyframe;
     assembler->latest.codec_config = assembler->active_codec_config;
     assembler->frames_completed += 1u;
+    if (assembler->keyframe_retry_pending &&
+        assembler->active_frame_seq == assembler->keyframe_retry_frame_seq) {
+        assembler->keyframe_retry_pending = 0u;
+        assembler->keyframe_retry_frame_seq = 0u;
+    }
     imt_assembler_reset_active(assembler);
     return 0;
 }
@@ -298,6 +316,7 @@ int imt_assembler_push_datagram(ImtAssembler* assembler,
 {
     ImtWireHeader header;
     const uint8_t* payload;
+    int accepting_newer_keyframe = 0;
     int rc;
 
     if (!assembler || !assembler->staging || !datagram) {
@@ -315,8 +334,29 @@ int imt_assembler_push_datagram(ImtAssembler* assembler,
     if (header.type == IMT_PACKET_TYPE_MAP) {
         return imt_assembler_handle_map(assembler, &header, payload);
     }
+    if (header.type == IMT_PACKET_TYPE_KEYFRAME_NACK) {
+        return 1; /* reverse-path control packet: never mutate video state */
+    }
     if (header.type != IMT_PACKET_TYPE_SLICE && header.type != IMT_PACKET_TYPE_PARITY) {
-        return 1; /* FEEDBACK and unknown types are not for the assembler */
+        return 1; /* FEEDBACK is not for the assembler */
+    }
+
+    if (assembler->keyframe_retry_pending) {
+        const int is_requested_retry =
+            header.frame_seq == assembler->keyframe_retry_frame_seq &&
+            (header.flags & IMT_PACKET_FLAG_KEYFRAME) != 0u;
+        const int is_newer_natural_keyframe =
+            header.frame_seq > assembler->keyframe_retry_frame_seq &&
+            (header.flags & IMT_PACKET_FLAG_KEYFRAME) != 0u;
+        if (!is_requested_retry && !is_newer_natural_keyframe) {
+            assembler->drops_stale += 1u;
+            return 1;
+        }
+        if (is_newer_natural_keyframe) {
+            assembler->keyframe_retry_pending = 0u;
+            assembler->keyframe_retry_frame_seq = 0u;
+            accepting_newer_keyframe = 1;
+        }
     }
 
     /* Latest-wins (R7.3): older frames are dropped outright. */
@@ -330,7 +370,17 @@ int imt_assembler_push_datagram(ImtAssembler* assembler,
     }
     if (!assembler->active_valid || header.frame_seq != assembler->active_frame_seq) {
         if (assembler->active_valid) {
+            assembler->last_incomplete_frame_seq = assembler->active_frame_seq;
+            assembler->last_incomplete_was_keyframe = assembler->active_keyframe;
+            assembler->last_incomplete_is_new = 1u;
             assembler->frames_incomplete += 1u; /* superseded while incomplete */
+            if (assembler->active_keyframe && assembler->keyframe_retry_enabled &&
+                !accepting_newer_keyframe) {
+                assembler->keyframe_retry_frame_seq = assembler->active_frame_seq;
+                assembler->keyframe_retry_pending = 1u;
+                imt_assembler_reset_active(assembler);
+                return 1;
+            }
         }
         imt_assembler_reset_active(assembler);
         if (imt_assembler_start_frame(assembler, &header) != 0) {
