@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.16)
 
 project(metapuppet_stream_sender C CXX)
 
+include(CTest)
+
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
@@ -85,7 +87,7 @@ if(UNIX AND NOT APPLE)
         src/mps_x264_encoder.c
     )
     set_target_properties(mps_stereo_x264_sender PROPERTIES
-        C_STANDARD 99
+        C_STANDARD 11
         C_STANDARD_REQUIRED ON
         C_EXTENSIONS OFF
     )
@@ -103,12 +105,36 @@ if(UNIX AND NOT APPLE)
             ${X264_STEREO_LIBRARIES}
     )
 
+    if(BUILD_TESTING)
+        add_executable(mps_x264_encoder_test
+            tests/mps_x264_encoder_test.c
+            src/mps_x264_encoder.c
+        )
+        if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+            target_compile_options(mps_x264_encoder_test PRIVATE -Wall -Wextra -Wpedantic)
+        endif()
+        target_include_directories(mps_x264_encoder_test PRIVATE
+            ${X264_STEREO_INCLUDE_DIRS}
+            ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
+        target_link_libraries(mps_x264_encoder_test PRIVATE
+            imt
+            ${X264_STEREO_LIBRARIES}
+        )
+        add_test(NAME mps_x264_encoder_test COMMAND mps_x264_encoder_test)
+    endif()
+
     find_package(PkgConfig REQUIRED)
     pkg_check_modules(LIBCAMERA REQUIRED IMPORTED_TARGET libcamera)
     pkg_check_modules(GSTREAMER REQUIRED IMPORTED_TARGET
         gstreamer-1.0
         gstreamer-app-1.0
     )
+
+    target_sources(mps_stereo_x264_sender PRIVATE
+        src/mps_libcamera_stereo_capture.cpp
+    )
+    target_link_libraries(mps_stereo_x264_sender PRIVATE PkgConfig::LIBCAMERA)
 
     add_executable(mps_libcamera_sbs_sender
         src/mps_libcamera_sbs_sender.cpp

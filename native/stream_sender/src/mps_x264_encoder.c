@@ -1,5 +1,6 @@
 #include "mps_x264_encoder.h"
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,6 +18,7 @@ struct MpsX264Ctx {
     MpsX264SliceInfo* slices;
     int nal_capacity;
     int slice_capacity;
+    int force_idr_each_frame;
 };
 
 static int mps_x264_reserve(MpsX264Ctx* ctx, int size)
@@ -120,13 +122,45 @@ static void mps_x264_fill_quant_offsets(MpsX264Ctx* ctx,
     }
 }
 
-MpsX264Ctx* mps_x264_init(uint32_t width, uint32_t height, uint32_t fps, float crf)
+void mps_x264_default_options(MpsX264Options* options)
+{
+    if (!options) {
+        return;
+    }
+    options->keyint = 1u;
+    options->threads = 1u;
+    options->slice_max_size = IMT_DEFAULT_MAX_PAYLOAD;
+    options->repeat_headers = 1;
+}
+
+MpsX264Ctx* mps_x264_init_ex(uint32_t width, uint32_t height, uint32_t fps, float crf,
+                             const MpsX264Options* options)
 {
     x264_param_t param;
     MpsX264Ctx* ctx;
+    MpsX264Options effective;
     uint32_t mb_count;
+    uint64_t mb_count64;
 
-    if (width == 0u || height == 0u || fps == 0u) {
+    if (width == 0u || height == 0u || fps == 0u ||
+        (width & 1u) != 0u || (height & 1u) != 0u ||
+        width > (uint32_t)INT_MAX || height > (uint32_t)INT_MAX ||
+        fps > (uint32_t)INT_MAX) {
+        return NULL;
+    }
+
+    mps_x264_default_options(&effective);
+    if (options) {
+        effective = *options;
+        if (effective.keyint == 0u) {
+            effective.keyint = 1u;
+        }
+        if (effective.threads == 0u) {
+            effective.threads = 1u;
+        }
+    }
+    if (effective.keyint > 0x7fffffffu || effective.threads > 0x7fffffffu ||
+        effective.slice_max_size > 0x7fffffffu) {
         return NULL;
     }
 
@@ -138,7 +172,13 @@ MpsX264Ctx* mps_x264_init(uint32_t width, uint32_t height, uint32_t fps, float c
     ctx->height = height;
     ctx->mb_width = (width + 15u) / 16u;
     ctx->mb_height = (height + 15u) / 16u;
-    mb_count = ctx->mb_width * ctx->mb_height;
+    mb_count64 = (uint64_t)ctx->mb_width * ctx->mb_height;
+    if (mb_count64 == 0u || mb_count64 > UINT32_MAX ||
+        mb_count64 > SIZE_MAX / sizeof(ctx->quant_offsets[0])) {
+        mps_x264_destroy(ctx);
+        return NULL;
+    }
+    mb_count = (uint32_t)mb_count64;
     ctx->quant_offsets = (float*)calloc(mb_count, sizeof(ctx->quant_offsets[0]));
     if (!ctx->quant_offsets) {
         mps_x264_destroy(ctx);
@@ -155,16 +195,17 @@ MpsX264Ctx* mps_x264_init(uint32_t width, uint32_t height, uint32_t fps, float c
     param.i_fps_den = 1;
     param.i_csp = X264_CSP_I420;
     param.b_annexb = 1;
-    param.b_repeat_headers = 1;
-    param.i_keyint_max = 1;
-    param.i_keyint_min = 1;
-    param.i_slice_max_size = (int)IMT_DEFAULT_MAX_PAYLOAD;
+    param.b_repeat_headers = effective.repeat_headers ? 1 : 0;
+    param.i_keyint_max = (int)effective.keyint;
+    param.i_keyint_min = (int)effective.keyint;
+    param.i_scenecut_threshold = 0;
+    param.i_slice_max_size = (int)effective.slice_max_size;
     param.b_sliced_threads = 0;
     param.rc.i_rc_method = X264_RC_CRF;
-    param.rc.f_rf_constant = crf > 0.0f ? crf : 23.0f;
-    param.rc.i_aq_mode = X264_AQ_VARIANCE;
-    param.i_threads = 1;
-    if (x264_param_apply_profile(&param, "main") < 0) {
+    param.rc.f_rf_constant = crf >= 0.0f ? crf : 23.0f;
+    param.rc.i_aq_mode = X264_AQ_NONE;
+    param.i_threads = (int)effective.threads;
+    if (x264_param_apply_profile(&param, "baseline") < 0) {
         mps_x264_destroy(ctx);
         return NULL;
     }
@@ -174,7 +215,13 @@ MpsX264Ctx* mps_x264_init(uint32_t width, uint32_t height, uint32_t fps, float c
         mps_x264_destroy(ctx);
         return NULL;
     }
+    ctx->force_idr_each_frame = effective.keyint == 1u;
     return ctx;
+}
+
+MpsX264Ctx* mps_x264_init(uint32_t width, uint32_t height, uint32_t fps, float crf)
+{
+    return mps_x264_init_ex(width, height, fps, crf, NULL);
 }
 
 void mps_x264_destroy(MpsX264Ctx* ctx)
@@ -194,6 +241,18 @@ void mps_x264_destroy(MpsX264Ctx* ctx)
 uint32_t mps_x264_mb_width(const MpsX264Ctx* ctx)
 {
     return ctx ? ctx->mb_width : 0u;
+}
+
+int mps_x264_set_crf(MpsX264Ctx* ctx, float crf)
+{
+    x264_param_t param;
+    if (!ctx || !ctx->enc || crf < 0.0f || crf > 51.0f) {
+        return -1;
+    }
+    x264_encoder_parameters(ctx->enc, &param);
+    param.rc.i_rc_method = X264_RC_CRF;
+    param.rc.f_rf_constant = crf;
+    return x264_encoder_reconfig(ctx->enc, &param) == 0 ? 0 : -2;
 }
 
 int mps_x264_encode(MpsX264Ctx* ctx,
@@ -220,10 +279,12 @@ int mps_x264_encode(MpsX264Ctx* ctx,
     *out_slices = NULL;
     *out_slice_count = 0u;
 
-    mps_x264_fill_quant_offsets(ctx, map, lut);
+    if (map && lut) {
+        mps_x264_fill_quant_offsets(ctx, map, lut);
+    }
     x264_picture_init(&pic_in);
     x264_picture_init(&pic_out);
-    pic_in.i_type = X264_TYPE_IDR;
+    pic_in.i_type = ctx->force_idr_each_frame ? X264_TYPE_IDR : X264_TYPE_AUTO;
     pic_in.i_pts = (int64_t)ctx->pts++;
     pic_in.img.i_csp = X264_CSP_I420;
     pic_in.img.i_plane = 3;
@@ -233,7 +294,7 @@ int mps_x264_encode(MpsX264Ctx* ctx,
     pic_in.img.i_stride[0] = (int)ctx->width;
     pic_in.img.i_stride[1] = (int)(ctx->width / 2u);
     pic_in.img.i_stride[2] = (int)(ctx->width / 2u);
-    pic_in.prop.quant_offsets = ctx->quant_offsets;
+    pic_in.prop.quant_offsets = (map && lut) ? ctx->quant_offsets : NULL;
 
     payload_size = x264_encoder_encode(ctx->enc, &nals, &nal_count, &pic_in, &pic_out);
     if (payload_size < 0) {
