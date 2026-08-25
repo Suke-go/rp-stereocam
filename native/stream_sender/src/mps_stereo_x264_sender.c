@@ -31,6 +31,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <sched.h>
@@ -41,6 +42,7 @@
 #include <unistd.h>
 
 #include <stdint.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -301,17 +303,96 @@ static void* capture_loop(void* arg)
     return NULL;
 }
 
-static FILE* open_cam(uint32_t idx, uint32_t w, uint32_t h, uint32_t fps,
-                      uint32_t buffer_count, const char* sync_role)
+static int parse_camera_float(const char* text, float minimum, float maximum,
+                              float* out_value)
 {
-    char cmd[512];
+    char* end = NULL;
+    float value;
+    if (!text || !*text || !out_value) {
+        return -1;
+    }
+    errno = 0;
+    value = strtof(text, &end);
+    if (errno != 0 || end == text || !end || *end != '\0' || !isfinite(value) ||
+        value < minimum || value > maximum) {
+        return -1;
+    }
+    *out_value = value;
+    return 0;
+}
+
+static void append_camera_option(char* options, size_t capacity,
+                                 const char* format, ...)
+{
+    size_t used;
+    va_list args;
+    if (!options || capacity == 0u || !format) {
+        return;
+    }
+    used = strlen(options);
+    if (used >= capacity - 1u) {
+        return;
+    }
+    va_start(args, format);
+    (void)vsnprintf(options + used, capacity - used, format, args);
+    va_end(args);
+}
+
+static void build_camera_options(char* options, size_t capacity,
+                                 const char* lens_environment_name)
+{
+    const char* awb = getenv("MPS_CAMERA_AWB_GAINS");
+    const char* shutter = getenv("MPS_CAMERA_SHUTTER_US");
+    const char* gain = getenv("MPS_CAMERA_ANALOG_GAIN");
+    const char* lens = lens_environment_name ? getenv(lens_environment_name) : NULL;
+    float red = 0.0f;
+    float blue = 0.0f;
+    float shutter_us = 0.0f;
+    float analogue_gain = 0.0f;
+    float lens_position = 0.0f;
+
+    if (!options || capacity == 0u) {
+        return;
+    }
+    options[0] = '\0';
+    if (awb && *awb) {
+        char* separator = NULL;
+        errno = 0;
+        red = strtof(awb, &separator);
+        if (errno == 0 && separator != awb && separator && *separator == ',' &&
+            isfinite(red) &&
+            red >= 0.01f && red <= 32.0f &&
+            parse_camera_float(separator + 1, 0.01f, 32.0f, &blue) == 0) {
+            append_camera_option(options, capacity, " --awbgains %.6g,%.6g",
+                                 (double)red, (double)blue);
+        }
+    }
+    if (parse_camera_float(shutter, 1.0f, 10000000.0f, &shutter_us) == 0 &&
+        parse_camera_float(gain, 1.0f, 64.0f, &analogue_gain) == 0) {
+        append_camera_option(options, capacity, " --shutter %.0f --gain %.6g",
+                             (double)shutter_us, (double)analogue_gain);
+    }
+    if (parse_camera_float(lens, 0.0f, 32.0f, &lens_position) == 0) {
+        append_camera_option(options, capacity, " --lens-position %.6g",
+                             (double)lens_position);
+    }
+}
+
+static FILE* open_cam(uint32_t idx, uint32_t w, uint32_t h, uint32_t fps,
+                      uint32_t buffer_count, const char* sync_role,
+                      const char* lens_environment_name)
+{
+    char cmd[768];
+    char camera_options[256];
     const char* sync_option = sync_role ? "--sync" : "";
     const char* sync_value = sync_role ? sync_role : "";
+    build_camera_options(camera_options, sizeof(camera_options), lens_environment_name);
     snprintf(cmd, sizeof(cmd),
              "rpicam-vid --camera %u --width %u --height %u --framerate %u --buffer-count %u "
-             "--codec yuv420 --timeout 0 --nopreview %s %s "
+             "--codec yuv420 --timeout 0 --nopreview %s %s%s "
              "--output - 2>/tmp/cam%u.log",
-             idx, w, h, fps, buffer_count, sync_option, sync_value, idx);
+             idx, w, h, fps, buffer_count, sync_option, sync_value,
+             camera_options, idx);
     {
         FILE* pipe = popen(cmd, "r");
         if (pipe) {
@@ -1117,6 +1198,18 @@ int main(int argc, char** argv)
     if (!capture_backend || !*capture_backend) {
         capture_backend = "libcamera";
     }
+    {
+        float configured_shutter_us = 0.0f;
+        if (fps != 0u && parse_camera_float(getenv("MPS_CAMERA_SHUTTER_US"),
+                                             1.0f, 10000000.0f,
+                                             &configured_shutter_us) == 0 &&
+            configured_shutter_us > 1000000.0f / (float)fps) {
+            fprintf(stderr,
+                    "warning: fixed shutter %.0fus exceeds the %.0fus frame interval; "
+                    "the requested %u fps cannot be sustained exactly\n",
+                    (double)configured_shutter_us, 1000000.0 / (double)fps, fps);
+        }
+    }
 
     if (!args_valid || port_value == 0u || port_value >= 0xFFFFu ||
         eye_w < 2u || eye_h < 2u || (eye_w & 1u) != 0u || (eye_h & 1u) != 0u ||
@@ -1130,6 +1223,9 @@ int main(int argc, char** argv)
                 "  env MPS_X264_CRF=20, MPS_X264_KEYINT=fps/2, MPS_CAMERA_BUFFERS=6,\n"
                 "      MPS_KERNEL_PACING_MBPS=0, MPS_CAMERA_SYNC=0 to disable software sync,\n"
                 "      MPS_CAPTURE_BACKEND=rpicam|libcamera, MPS_CAMERA_MAX_SKEW_MS=5,\n"
+                "      MPS_CAMERA_AWB_GAINS=red,blue, MPS_CAMERA_SHUTTER_US=N,\n"
+                "      MPS_CAMERA_ANALOG_GAIN=N, MPS_CAMERA_LEFT_LENS_POSITION=N,\n"
+                "      MPS_CAMERA_RIGHT_LENS_POSITION=N,\n"
                 "      MPS_KEYFRAME_NACK=1 (set 0 to disable one-shot keyframe retry),\n"
                 "      MPS_ADAPTIVE=1, MPS_ADAPTIVE_TARGET_MS=ceil(1000/fps), "
                 "MPS_ADAPTIVE_CRF_MAX=30\n",
@@ -1198,9 +1294,11 @@ int main(int argc, char** argv)
     }
 
     cap.right_pipe = open_cam(right_cam, eye_w, eye_h, fps, camera_buffers,
-                              camera_sync_enabled ? "client" : NULL);
+                              camera_sync_enabled ? "client" : NULL,
+                              "MPS_CAMERA_RIGHT_LENS_POSITION");
     cap.left_pipe  = open_cam(left_cam, eye_w, eye_h, fps, camera_buffers,
-                              camera_sync_enabled ? "server" : NULL);
+                              camera_sync_enabled ? "server" : NULL,
+                              "MPS_CAMERA_LEFT_LENS_POSITION");
     if (!cap.left_pipe || !cap.right_pipe) {
         fprintf(stderr, "failed to start rpicam-vid (see /tmp/cam*.log)\n");
         if (cap.left_pipe) pclose(cap.left_pipe);

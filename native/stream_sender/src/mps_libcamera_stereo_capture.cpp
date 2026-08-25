@@ -11,9 +11,12 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -48,6 +51,91 @@ struct CaptureNotify {
     std::atomic<uint64_t> generation{0};
     std::atomic<bool> failed{false};
 };
+
+struct CameraTuning {
+    bool fixed_awb = false;
+    float awb_red = 0.0f;
+    float awb_blue = 0.0f;
+    bool fixed_exposure = false;
+    int32_t exposure_us = 0;
+    float analogue_gain = 0.0f;
+    bool fixed_lens = false;
+    float lens_position = 0.0f;
+};
+
+static bool parseFloat(const char* text, float minimum, float maximum, float* value)
+{
+    char* end = nullptr;
+    if (!text || !*text || !value) {
+        return false;
+    }
+    errno = 0;
+    const float parsed = std::strtof(text, &end);
+    if (errno != 0 || end == text || *end != '\0' || !std::isfinite(parsed) ||
+        parsed < minimum || parsed > maximum) {
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
+static CameraTuning loadCommonTuning()
+{
+    CameraTuning tuning;
+    const char* awb = std::getenv("MPS_CAMERA_AWB_GAINS");
+    if (awb && *awb) {
+        char* separator = nullptr;
+        errno = 0;
+        const float red = std::strtof(awb, &separator);
+        const char* blue_text = separator && *separator == ',' ? separator + 1 : nullptr;
+        float blue = 0.0f;
+        if (errno == 0 && separator != awb && blue_text &&
+            std::isfinite(red) && red >= 0.01f && red <= 32.0f &&
+            parseFloat(blue_text, 0.01f, 32.0f, &blue)) {
+            tuning.fixed_awb = true;
+            tuning.awb_red = red;
+            tuning.awb_blue = blue;
+        } else {
+            std::fprintf(stderr,
+                         "warning: ignoring invalid MPS_CAMERA_AWB_GAINS=%s "
+                         "(expected red,blue)\n", awb);
+        }
+    }
+
+    const char* shutter = std::getenv("MPS_CAMERA_SHUTTER_US");
+    const char* gain = std::getenv("MPS_CAMERA_ANALOG_GAIN");
+    if ((shutter && *shutter) || (gain && *gain)) {
+        float shutter_value = 0.0f;
+        float gain_value = 0.0f;
+        if (parseFloat(shutter, 1.0f, 10000000.0f, &shutter_value) &&
+            parseFloat(gain, 1.0f, 64.0f, &gain_value)) {
+            tuning.fixed_exposure = true;
+            tuning.exposure_us = static_cast<int32_t>(std::lround(shutter_value));
+            tuning.analogue_gain = gain_value;
+        } else {
+            std::fprintf(stderr,
+                         "warning: MPS_CAMERA_SHUTTER_US and "
+                         "MPS_CAMERA_ANALOG_GAIN must both be valid; keeping AE enabled\n");
+        }
+    }
+    return tuning;
+}
+
+static CameraTuning withLensPosition(CameraTuning tuning, const char* environment_name)
+{
+    const char* value = std::getenv(environment_name);
+    if (value && *value) {
+        float position = 0.0f;
+        if (parseFloat(value, 0.0f, 32.0f, &position)) {
+            tuning.fixed_lens = true;
+            tuning.lens_position = position;
+        } else {
+            std::fprintf(stderr, "warning: ignoring invalid %s=%s\n",
+                         environment_name, value);
+        }
+    }
+    return tuning;
+}
 
 class CameraEye {
 public:
@@ -150,6 +238,50 @@ public:
             camera_->controls().find(&libcamera::controls::rpi::SyncMode) != camera_->controls().end()) {
             controls.set(libcamera::controls::rpi::SyncMode, sync_mode);
         }
+        if (tuning_.fixed_awb) {
+            const bool supports_awb =
+                camera_->controls().find(&libcamera::controls::AwbEnable) != camera_->controls().end() &&
+                camera_->controls().find(&libcamera::controls::ColourGains) != camera_->controls().end();
+            if (supports_awb) {
+                controls.set(libcamera::controls::AwbEnable, false);
+                controls.set(libcamera::controls::ColourGains,
+                             libcamera::Span<const float, 2>(
+                                 {tuning_.awb_red, tuning_.awb_blue}));
+            } else {
+                std::fprintf(stderr, "%s camera does not support fixed AWB controls\n", label_);
+            }
+        }
+        if (tuning_.fixed_exposure) {
+            const bool supports_exposure =
+                camera_->controls().find(&libcamera::controls::AeEnable) != camera_->controls().end() &&
+                camera_->controls().find(&libcamera::controls::ExposureTime) != camera_->controls().end() &&
+                camera_->controls().find(&libcamera::controls::AnalogueGain) != camera_->controls().end();
+            if (supports_exposure) {
+                controls.set(libcamera::controls::AeEnable, false);
+                controls.set(libcamera::controls::ExposureTime, tuning_.exposure_us);
+                controls.set(libcamera::controls::AnalogueGain, tuning_.analogue_gain);
+            } else {
+                std::fprintf(stderr, "%s camera does not support fixed exposure controls\n", label_);
+            }
+        }
+        if (tuning_.fixed_lens) {
+            const bool supports_lens =
+                camera_->controls().find(&libcamera::controls::AfMode) != camera_->controls().end() &&
+                camera_->controls().find(&libcamera::controls::LensPosition) != camera_->controls().end();
+            if (supports_lens) {
+                controls.set(libcamera::controls::AfMode,
+                             libcamera::controls::AfModeManual);
+                controls.set(libcamera::controls::LensPosition, tuning_.lens_position);
+            } else {
+                std::fprintf(stderr, "%s camera does not support manual lens controls\n", label_);
+            }
+        }
+
+        std::fprintf(stderr,
+                     "%s camera controls: awb=%s exposure=%s lens=%s\n",
+                     label_, tuning_.fixed_awb ? "fixed" : "auto",
+                     tuning_.fixed_exposure ? "fixed" : "auto",
+                     tuning_.fixed_lens ? "fixed" : "auto");
 
         running_.store(true, std::memory_order_release);
         int rc = camera_->start(&controls);
@@ -185,6 +317,8 @@ public:
     }
 
     uint64_t dropped() const { return dropped_.load(std::memory_order_relaxed); }
+
+    void setTuning(const CameraTuning& tuning) { tuning_ = tuning; }
 
 private:
     friend struct DirectCapture;
@@ -324,6 +458,7 @@ private:
     bool started_ = false;
     bool acquired_ = false;
     bool callback_connected_ = false;
+    CameraTuning tuning_;
 };
 
 struct DirectCapture {
@@ -335,6 +470,9 @@ struct DirectCapture {
           frame_size(static_cast<size_t>(width) * height * 3u / 2u),
           max_skew_ns(max_skew_ns), software_sync(sync)
     {
+        const CameraTuning common = loadCommonTuning();
+        left.setTuning(withLensPosition(common, "MPS_CAMERA_LEFT_LENS_POSITION"));
+        right.setTuning(withLensPosition(common, "MPS_CAMERA_RIGHT_LENS_POSITION"));
     }
 
     ~DirectCapture()

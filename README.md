@@ -76,6 +76,30 @@ without a child process or pipe. Set `MPS_CAPTURE_BACKEND=rpicam` for the
 diagnostic fallback. Use `MPS_CAMERA_MAX_SKEW_MS` (default 5) to set the direct
 backend's pairing limit.
 
+For stable colour and geometrically valid rectification, use the same manual
+camera controls that were recorded in the calibration JSON. Both the direct
+libcamera backend and the `rpicam-vid` fallback accept these variables. The
+current `s1` calibration (left camera 0, right camera 1) is launched as:
+
+```bash
+MPS_CAMERA_AWB_GAINS=1.769247,2.343446 \
+MPS_CAMERA_SHUTTER_US=26974 MPS_CAMERA_ANALOG_GAIN=1.499268 \
+MPS_CAMERA_LEFT_LENS_POSITION=0.792 MPS_CAMERA_RIGHT_LENS_POSITION=0.787 \
+  ./build/pi_stream_sender/mps_stereo_x264_sender \
+  192.168.137.1 5004 1280 720 30 0 1
+```
+
+For a 60 fps colour/geometry check, keep the fixed AWB and two lens-position
+variables but omit `MPS_CAMERA_SHUTTER_US` and `MPS_CAMERA_ANALOG_GAIN`; AE
+then remains enabled and can satisfy the shorter frame interval.
+
+Use the values from a newer `rectify_<session>.json` after recalibration.
+Shutter and analogue gain must be supplied together; otherwise AE remains
+enabled. A shutter of 26974 microseconds cannot sustain 60 fps, so this exact
+calibration example uses 30 fps. `MPS_CAMERA_AWB_GAINS` disables AWB, while
+the per-eye lens positions put autofocus into manual mode. If none of these
+variables is set, the previous automatic camera behaviour is preserved.
+
 `MPS_ADAPTIVE=0` disables adaptive CRF. Dynamic resolution is deliberately not
 performed because it would also require coordinated decoder and Unity texture
 renegotiation; when encoding is late, latest-frame capture naturally drops

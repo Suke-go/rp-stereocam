@@ -26,6 +26,10 @@ and host queueing-discipline changes are intentionally outside its scope.
   Raspberry Pi server/client `SyncMode` controls, pairs on sensor timestamps,
   and hands pooled contiguous I420 buffers to the encoder workers. The
   `rpicam` backend remains available as a diagnostic fallback.
+  Optional fixed AWB gains, shutter/analogue gain, and per-eye lens positions
+  are applied by both backends so runtime capture can exactly match the
+  calibration session instead of allowing the two cameras' automatic loops
+  to drift independently.
   The controls mirror the official
   [rpicam-apps implementation](https://github.com/raspberrypi/rpicam-apps/blob/main/core/rpicam_app.cpp).
 - The PC decoder can use Media Foundation D3D11 NV12 output surfaces. At the
