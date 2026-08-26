@@ -36,6 +36,7 @@ extern "C" {
 #define IMT_PACKET_TYPE_MAP 1u
 #define IMT_PACKET_TYPE_PARITY 2u
 #define IMT_PACKET_TYPE_FEEDBACK 3u
+#define IMT_PACKET_TYPE_KEYFRAME_NACK 4u
 
 #define IMT_PACKET_FLAG_KEYFRAME (1u << 0)
 #define IMT_PACKET_FLAG_CODEC_CONFIG (1u << 1)
@@ -173,7 +174,8 @@ int imt_wire_encode_header(const ImtWireHeader* header, uint8_t* dst, size_t dst
 /* Parses and validates a 40-byte header. Returns:
  *   0 success, -1 bad arguments / short buffer,
  *  -2 magic, version or header_size mismatch (R6.5),
- *  -3 payload_size inconsistent with the datagram size. */
+ *  -3 payload_size inconsistent with the datagram size,
+ *  -4 packet type is not defined for this wire version. */
 int imt_wire_decode_header(const uint8_t* data, size_t size, ImtWireHeader* out_header);
 
 /* FEEDBACK payload (32 bytes, R6.4). */
@@ -287,6 +289,16 @@ typedef struct ImtAssembler {
     uint8_t active_valid;
     uint8_t active_keyframe;
     uint8_t active_codec_config;
+    /* One-shot notification consumed by the receiver thread. It is latched
+     * before reset_active() discards a superseded incomplete frame. */
+    uint64_t last_incomplete_frame_seq;
+    uint8_t last_incomplete_was_keyframe;
+    uint8_t last_incomplete_is_new;
+    /* Optional recovery gate. While pending, interframes newer than the
+     * requested keyframe are ignored until its retry or a natural keyframe. */
+    uint64_t keyframe_retry_frame_seq;
+    uint8_t keyframe_retry_enabled;
+    uint8_t keyframe_retry_pending;
     /* last-known-good importance map (R2.5) */
     uint64_t map_frame_seq;
     uint32_t map_tile_count;
@@ -311,6 +323,10 @@ typedef struct ImtAssembler {
 int imt_assembler_init(ImtAssembler* assembler, size_t max_frame_size,
                        size_t max_payload, uint32_t max_map_tiles);
 void imt_assembler_destroy(ImtAssembler* assembler);
+
+/* Enables/disables the recovery gate used with KEYFRAME_NACK. Disabled by
+ * default so existing/SBS assembler users retain latest-wins behavior. */
+int imt_assembler_set_keyframe_retry_enabled(ImtAssembler* assembler, int enabled);
 
 /* Feeds one received datagram (header + payload). Returns:
  *   0  a frame was completed and published to `latest`,

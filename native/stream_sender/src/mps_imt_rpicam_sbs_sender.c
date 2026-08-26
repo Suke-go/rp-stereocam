@@ -7,11 +7,16 @@
 #endif
 
 #include "imt.h"
+#ifdef MPS_RVM_ENABLED
+#include "mps_rvm_importance.h"
+#endif
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -20,10 +25,22 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define MAP_SEND_INTERVAL 10u
+#define FEEDBACK_PORT 5005u
+#define FEEDBACK_RECV_TIMEOUT_US 100000
+#define IMT_TARGET_LATENCY_NS 50000000ll
+
 typedef struct {
     int fd;
     struct sockaddr_in addr;
 } SendCtx;
+
+typedef struct {
+    int fd;
+    ImtPace* pace;
+    pthread_mutex_t lock;
+    volatile int stop;
+} FeedbackState;
 
 static int emit_datagram(const uint8_t* data, size_t len, void* user)
 {
@@ -38,6 +55,124 @@ static uint64_t now_ns(void)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void* feedback_thread(void* arg)
+{
+    FeedbackState* state = (FeedbackState*)arg;
+    uint8_t buf[IMT_WIRE_HEADER_SIZE + IMT_WIRE_FEEDBACK_PAYLOAD_SIZE];
+
+    while (!state->stop) {
+        const ssize_t n = recv(state->fd, buf, sizeof(buf), 0);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (n == (ssize_t)sizeof(buf)) {
+            ImtWireHeader header;
+            ImtFeedback feedback;
+            if (imt_wire_decode_header(buf, (size_t)n, &header) == 0 &&
+                header.type == IMT_PACKET_TYPE_FEEDBACK &&
+                imt_wire_decode_feedback(buf + IMT_WIRE_HEADER_SIZE,
+                                         IMT_WIRE_FEEDBACK_PAYLOAD_SIZE,
+                                         &feedback) == 0) {
+                pthread_mutex_lock(&state->lock);
+                (void)imt_pace_update(state->pace, (int64_t)feedback.frame_age_ns);
+                pthread_mutex_unlock(&state->lock);
+            }
+        }
+    }
+    return NULL;
+}
+
+static int feedback_state_start(FeedbackState* state, ImtPace* pace, pthread_t* thread)
+{
+    struct sockaddr_in addr;
+    struct timeval timeout;
+
+    memset(state, 0, sizeof(*state));
+    state->fd = -1;
+    state->pace = pace;
+    if (pthread_mutex_init(&state->lock, NULL) != 0) {
+        return -1;
+    }
+
+    state->fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (state->fd < 0) {
+        pthread_mutex_destroy(&state->lock);
+        return -2;
+    }
+
+    timeout.tv_sec = 0;
+    timeout.tv_usec = FEEDBACK_RECV_TIMEOUT_US;
+    (void)setsockopt(state->fd, SOL_SOCKET, SO_RCVTIMEO,
+                     &timeout, sizeof(timeout));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(FEEDBACK_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if (bind(state->fd, (const struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        close(state->fd);
+        state->fd = -1;
+        pthread_mutex_destroy(&state->lock);
+        return -3;
+    }
+
+    if (pthread_create(thread, NULL, feedback_thread, state) != 0) {
+        close(state->fd);
+        state->fd = -1;
+        pthread_mutex_destroy(&state->lock);
+        return -4;
+    }
+    return 0;
+}
+
+static void feedback_state_stop(FeedbackState* state, pthread_t thread)
+{
+    if (!state || state->fd < 0) {
+        return;
+    }
+    state->stop = 1;
+    (void)pthread_join(thread, NULL);
+    close(state->fd);
+    state->fd = -1;
+    pthread_mutex_destroy(&state->lock);
+}
+
+static int32_t feedback_state_rate_q16(FeedbackState* state)
+{
+    int32_t rate;
+    if (!state || state->fd < 0 || !state->pace) {
+        return IMT_PACE_Q16_ONE;
+    }
+
+    pthread_mutex_lock(&state->lock);
+    rate = imt_pace_rate_q16(state->pace);
+    pthread_mutex_unlock(&state->lock);
+    return rate;
+}
+
+static void apply_feedback_pacing(FeedbackState* state, uint32_t fps)
+{
+    const int32_t rate = feedback_state_rate_q16(state);
+    if (fps == 0u || rate <= 0 || rate >= IMT_PACE_Q16_ONE) {
+        return;
+    }
+    {
+        const uint64_t frame_us = 1000000ull / fps;
+        const uint64_t extra_us =
+            (frame_us * (uint64_t)(IMT_PACE_Q16_ONE - rate)) / IMT_PACE_Q16_ONE;
+        if (extra_us > 0u) {
+            struct timespec delay;
+            delay.tv_sec = (time_t)(extra_us / 1000000ull);
+            delay.tv_nsec = (long)((extra_us % 1000000ull) * 1000ull);
+            while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {
+            }
+        }
+    }
 }
 
 static int read_exact(FILE* pipe, uint8_t* data, size_t size)
@@ -102,6 +237,51 @@ static FILE* open_cam(uint32_t idx, uint32_t w, uint32_t h, uint32_t fps)
     return popen(cmd, "r");
 }
 
+static int fill_chunk_weights(const ImtMap* map,
+                              uint8_t* chunk_weights,
+                              uint32_t chunk_count,
+                              uint32_t sbs_w,
+                              uint32_t frame_size)
+{
+    int mean_int;
+    uint32_t mean;
+    uint32_t ci;
+
+    if (!map || !map->weights || !chunk_weights || map->tile_size == 0u ||
+        map->cols == 0u || map->tile_count == 0u || sbs_w == 0u) {
+        return -1;
+    }
+
+    mean_int = imt_map_mean(map);
+    mean = mean_int > 0 ? (uint32_t)mean_int : 1u;
+    for (ci = 0u; ci < chunk_count; ++ci) {
+        const uint32_t offset = ci * (uint32_t)IMT_DEFAULT_MAX_PAYLOAD;
+        uint32_t payload_size = frame_size - offset;
+        uint32_t mid_byte;
+        uint32_t mid_pixel;
+        uint32_t row;
+        uint32_t col;
+        uint32_t tile_idx;
+
+        if (payload_size > (uint32_t)IMT_DEFAULT_MAX_PAYLOAD) {
+            payload_size = (uint32_t)IMT_DEFAULT_MAX_PAYLOAD;
+        }
+        mid_byte = offset + payload_size / 2u;
+        if (mid_byte >= frame_size) {
+            mid_byte = frame_size - 1u;
+        }
+        mid_pixel = mid_byte / 4u;
+        row = mid_pixel / sbs_w;
+        col = mid_pixel % sbs_w;
+        tile_idx = (row / map->tile_size) * map->cols + (col / map->tile_size);
+        if (tile_idx >= map->tile_count) {
+            tile_idx = map->tile_count - 1u;
+        }
+        chunk_weights[ci] = (uint8_t)imt_map_normalized_weight(map->weights[tile_idx], mean);
+    }
+    return 0;
+}
+
 int main(int argc, char** argv)
 {
     const char* host    = argc > 1 ? argv[1]                    : "192.168.137.1";
@@ -125,40 +305,77 @@ int main(int argc, char** argv)
 
     const size_t yuv_size  = (size_t)eye_w * eye_h * 3u / 2u;
     const size_t rgba_size = (size_t)eye_w * 2u * eye_h * 4u;
+    const size_t chunk_count_size =
+        (rgba_size + IMT_DEFAULT_MAX_PAYLOAD - 1u) / IMT_DEFAULT_MAX_PAYLOAD;
 
     uint8_t* left_yuv  = (uint8_t*)malloc(yuv_size);
     uint8_t* right_yuv = (uint8_t*)malloc(yuv_size);
     uint8_t* sbs_rgba  = (uint8_t*)malloc(rgba_size);
-    if (!left_yuv || !right_yuv || !sbs_rgba) {
+    uint8_t* chunk_weights = (uint8_t*)malloc(chunk_count_size);
+    if (!left_yuv || !right_yuv || !sbs_rgba || !chunk_weights ||
+        rgba_size > UINT32_MAX || chunk_count_size > UINT32_MAX) {
         fprintf(stderr, "malloc failed\n");
-        free(left_yuv); free(right_yuv); free(sbs_rgba);
+        free(left_yuv);
+        free(right_yuv);
+        free(sbs_rgba);
+        free(chunk_weights);
         return 2;
     }
 
     ImtMap map;
     if (imt_map_init(&map, eye_w * 2u, eye_h, 32u) != 0) {
         fprintf(stderr, "imt_map_init failed\n");
-        free(left_yuv); free(right_yuv); free(sbs_rgba);
+        free(left_yuv);
+        free(right_yuv);
+        free(sbs_rgba);
+        free(chunk_weights);
         return 3;
     }
     imt_map_fill(&map, 128u);
+#ifdef MPS_RVM_ENABLED
+    MpsRvmCtx* rvm = NULL;
+    {
+        const char* rvm_model = getenv("RVM_MODEL");
+        if (!rvm_model) rvm_model = "/home/admin/MetaPuppet/models/rvm_mobilenetv3_fp32.onnx";
+        rvm = mps_rvm_init(rvm_model, eye_w, eye_h);
+        if (!rvm) fprintf(stderr, "RVM init failed – using uniform importance map\n");
+    }
+#endif
 
     ImtPacketizer pkt;
     if (imt_packetizer_init(&pkt, 0, 0) != 0) {
         fprintf(stderr, "imt_packetizer_init failed\n");
         imt_map_destroy(&map);
-        free(left_yuv); free(right_yuv); free(sbs_rgba);
+        free(left_yuv);
+        free(right_yuv);
+        free(sbs_rgba);
+        free(chunk_weights);
         return 4;
     }
 
     SendCtx ctx;
     ctx.fd = socket(AF_INET, SOCK_DGRAM, 0);
-    if (ctx.fd < 0) { return 5; }
+    if (ctx.fd < 0) {
+        imt_packetizer_destroy(&pkt);
+        imt_map_destroy(&map);
+        free(left_yuv);
+        free(right_yuv);
+        free(sbs_rgba);
+        free(chunk_weights);
+        return 5;
+    }
     memset(&ctx.addr, 0, sizeof(ctx.addr));
     ctx.addr.sin_family = AF_INET;
     ctx.addr.sin_port   = htons(port);
     if (inet_pton(AF_INET, host, &ctx.addr.sin_addr) != 1) {
-        close(ctx.fd); return 6;
+        close(ctx.fd);
+        imt_packetizer_destroy(&pkt);
+        imt_map_destroy(&map);
+        free(left_yuv);
+        free(right_yuv);
+        free(sbs_rgba);
+        free(chunk_weights);
+        return 6;
     }
 
     FILE* left_pipe  = open_cam(left_cam,  eye_w, eye_h, fps);
@@ -170,7 +387,10 @@ int main(int argc, char** argv)
         close(ctx.fd);
         imt_packetizer_destroy(&pkt);
         imt_map_destroy(&map);
-        free(left_yuv); free(right_yuv); free(sbs_rgba);
+        free(left_yuv);
+        free(right_yuv);
+        free(sbs_rgba);
+        free(chunk_weights);
         return 7;
     }
 
@@ -178,6 +398,20 @@ int main(int argc, char** argv)
             "mps-imt-rpicam-sbs → %s:%u  left=cam%u(xf%d) right=cam%u(xf%d)  eye=%ux%u sbs=%ux%u @ %u fps\n",
             host, port, left_cam, left_xform, right_cam, right_xform,
             eye_w, eye_h, eye_w * 2u, eye_h, fps);
+
+    ImtPace pace;
+    FeedbackState feedback;
+    pthread_t feedback_tid;
+    int feedback_started = 0;
+    if (imt_pace_init(&pace, IMT_TARGET_LATENCY_NS) == 0) {
+        const int feedback_rc = feedback_state_start(&feedback, &pace, &feedback_tid);
+        if (feedback_rc == 0) {
+            feedback_started = 1;
+            fprintf(stderr, "feedback receiver listening on UDP %u\n", FEEDBACK_PORT);
+        } else {
+            fprintf(stderr, "feedback receiver disabled: %d\n", feedback_rc);
+        }
+    }
 
     uint64_t frame_seq = 0;
     for (;;) {
@@ -192,21 +426,53 @@ int main(int argc, char** argv)
 
         yuv420_to_rgba_sbs(left_yuv,  sbs_rgba, eye_w, eye_h, 0u,    left_xform);
         yuv420_to_rgba_sbs(right_yuv, sbs_rgba, eye_w, eye_h, eye_w, right_xform);
+#ifdef MPS_RVM_ENABLED
+        if (rvm) {
+            mps_rvm_update_map(rvm, left_yuv,  (uint32_t)yuv_size, &map, 0u);
+            mps_rvm_update_map(rvm, right_yuv, (uint32_t)yuv_size, &map, eye_w);
+        }
+#endif
 
-        imt_packetizer_send_frame(&pkt,
-                                  sbs_rgba, (uint32_t)rgba_size,
-                                  frame_seq, now_ns(),
-                                  IMT_PACKET_FLAG_KEYFRAME,
-                                  NULL, 0,
-                                  emit_datagram, &ctx);
+        {
+            const uint64_t capture_timestamp_ns = now_ns();
+            const uint32_t chunk_count = (uint32_t)chunk_count_size;
+            if (fill_chunk_weights(&map, chunk_weights, chunk_count,
+                                   eye_w * 2u, (uint32_t)rgba_size) != 0) {
+                fprintf(stderr, "fill_chunk_weights failed\n");
+                break;
+            }
+            (void)imt_packetizer_send_frame(&pkt,
+                                            sbs_rgba, (uint32_t)rgba_size,
+                                            frame_seq, capture_timestamp_ns,
+                                            IMT_PACKET_FLAG_KEYFRAME,
+                                            chunk_weights, chunk_count,
+                                            emit_datagram, &ctx);
+            if (frame_seq % MAP_SEND_INTERVAL == 0u) {
+                (void)imt_packetizer_send_map(&pkt, &map, frame_seq,
+                                              capture_timestamp_ns,
+                                              emit_datagram, &ctx);
+            }
+        }
+        if (feedback_started) {
+            apply_feedback_pacing(&feedback, fps);
+        }
         frame_seq += 1u;
     }
 
+    if (feedback_started) {
+        feedback_state_stop(&feedback, feedback_tid);
+    }
+#ifdef MPS_RVM_ENABLED
+    if (rvm) mps_rvm_destroy(rvm);
+#endif
     pclose(left_pipe);
     pclose(right_pipe);
     close(ctx.fd);
     imt_packetizer_destroy(&pkt);
     imt_map_destroy(&map);
-    free(left_yuv); free(right_yuv); free(sbs_rgba);
+    free(left_yuv);
+    free(right_yuv);
+    free(sbs_rgba);
+    free(chunk_weights);
     return 0;
 }

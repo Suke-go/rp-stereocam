@@ -104,14 +104,23 @@ static int imt_test_emit(const uint8_t* datagram, size_t len, void* user)
     return 0;
 }
 
-static int imt_test_capture_frame(ImtPacketizer* packetizer, uint64_t frame_seq,
-                                  const uint8_t* weights, uint32_t weight_count)
+static int imt_test_capture_frame_flags(ImtPacketizer* packetizer,
+                                        uint64_t frame_seq, uint16_t flags,
+                                        const uint8_t* weights,
+                                        uint32_t weight_count)
 {
     g_capture.count = 0;
     imt_test_fill_random(g_frame, TEST_FRAME_SIZE, (uint32_t)frame_seq * 7919u + 17u);
     return imt_packetizer_send_frame(packetizer, g_frame, TEST_FRAME_SIZE, frame_seq,
-                                     frame_seq * 1000u, 0, weights, weight_count,
+                                     frame_seq * 1000u, flags, weights, weight_count,
                                      imt_test_emit, &g_capture);
+}
+
+static int imt_test_capture_frame(ImtPacketizer* packetizer, uint64_t frame_seq,
+                                  const uint8_t* weights, uint32_t weight_count)
+{
+    return imt_test_capture_frame_flags(packetizer, frame_seq, 0,
+                                        weights, weight_count);
 }
 
 /* Delivers every captured datagram whose index is not flagged in drop[]. */
@@ -394,6 +403,19 @@ static void test_wire(void)
     CHECK(imt_wire_decode_header(buffer, IMT_WIRE_HEADER_SIZE - 1u, &decoded) == -1);
     CHECK(imt_wire_decode_header(buffer, IMT_WIRE_HEADER_SIZE + 10u, &decoded) == -3);
 
+    /* Header-only reverse-path KEYFRAME_NACK uses frame_seq as its sole value. */
+    memset(&header, 0, sizeof(header));
+    memset(buffer, 0, sizeof(buffer));
+    header.type = IMT_PACKET_TYPE_KEYFRAME_NACK;
+    header.frame_seq = 0x8877665544332211ull;
+    CHECK(imt_wire_encode_header(&header, buffer, IMT_WIRE_HEADER_SIZE) == 0);
+    CHECK(imt_wire_decode_header(buffer, IMT_WIRE_HEADER_SIZE, &decoded) == 0);
+    CHECK(decoded.type == IMT_PACKET_TYPE_KEYFRAME_NACK);
+    CHECK(decoded.frame_seq == header.frame_seq);
+    CHECK(decoded.payload_size == 0u);
+    buffer[3] = 0x7Fu;
+    CHECK(imt_wire_decode_header(buffer, IMT_WIRE_HEADER_SIZE, &decoded) == -4);
+
     /* FEEDBACK payload (R6.4) */
     memset(&feedback, 0, sizeof(feedback));
     memset(&feedback_decoded, 0, sizeof(feedback_decoded));
@@ -605,7 +627,10 @@ static void test_assembler_unrecoverable_then_supersede(void)
     CHECK(imt_assembler_init(&assembler, TEST_MAX_FRAME, 0, 0) == 0);
 
     /* frame 1: drop two data chunks of group 0 -> unrecoverable (R7.3) */
-    CHECK(imt_test_capture_frame(&packetizer, 1, NULL, 0) == 0);
+    CHECK(imt_test_capture_frame_flags(
+              &packetizer, 1,
+              IMT_PACKET_FLAG_KEYFRAME | IMT_PACKET_FLAG_CODEC_CONFIG,
+              NULL, 0) == 0);
     memset(drop, 0, sizeof(drop));
     for (i = 0; i < g_capture.count; ++i) {
         const ImtWireHeader* h = &g_capture.headers[i];
@@ -618,6 +643,19 @@ static void test_assembler_unrecoverable_then_supersede(void)
     CHECK(assembler.latest.size == 0);       /* nothing published */
     CHECK(assembler.frames_completed == 0);
 
+    {
+        uint8_t nack[IMT_WIRE_HEADER_SIZE];
+        ImtWireHeader nack_header;
+        const uint64_t active_seq = assembler.active_frame_seq;
+        memset(&nack_header, 0, sizeof(nack_header));
+        nack_header.type = IMT_PACKET_TYPE_KEYFRAME_NACK;
+        nack_header.frame_seq = 1u;
+        CHECK(imt_wire_encode_header(&nack_header, nack, sizeof(nack)) == 0);
+        CHECK(imt_assembler_push_datagram(&assembler, nack, sizeof(nack)) == 1);
+        CHECK(assembler.active_valid == 1u);
+        CHECK(assembler.active_frame_seq == active_seq);
+    }
+
     /* frame 2 arrives complete and supersedes the stuck frame 1 */
     CHECK(imt_test_capture_frame(&packetizer, 2, NULL, 0) == 0);
     imt_test_deliver(&assembler, NULL);
@@ -625,6 +663,9 @@ static void test_assembler_unrecoverable_then_supersede(void)
     CHECK(assembler.latest.frame_seq == 2);
     CHECK(memcmp(assembler.latest.data, g_frame, TEST_FRAME_SIZE) == 0);
     CHECK(assembler.frames_incomplete == 1); /* frame 1 was discarded */
+    CHECK(assembler.last_incomplete_is_new == 1u);
+    CHECK(assembler.last_incomplete_was_keyframe == 1u);
+    CHECK(assembler.last_incomplete_frame_seq == 1u);
 
     /* a late datagram from frame 1 is now stale and ignored */
     CHECK(imt_test_capture_frame(&packetizer, 1, NULL, 0) == 0);
@@ -632,6 +673,92 @@ static void test_assembler_unrecoverable_then_supersede(void)
                                       g_capture.sizes[0]) == 1);
     CHECK(assembler.drops_stale >= 1);
 
+    imt_assembler_destroy(&assembler);
+    imt_packetizer_destroy(&packetizer);
+}
+
+static void test_assembler_keyframe_retry_gate(void)
+{
+    ImtPacketizer packetizer;
+    ImtAssembler assembler;
+    uint8_t drop[TEST_MAX_DATAGRAMS];
+    int i;
+
+    CHECK(imt_packetizer_init(&packetizer, 0, 0) == 0);
+    CHECK(imt_assembler_init(&assembler, TEST_MAX_FRAME, 0, 0) == 0);
+    CHECK(imt_assembler_set_keyframe_retry_enabled(&assembler, 1) == 0);
+
+    CHECK(imt_test_capture_frame_flags(
+              &packetizer, 10,
+              IMT_PACKET_FLAG_KEYFRAME | IMT_PACKET_FLAG_CODEC_CONFIG,
+              NULL, 0) == 0);
+    memset(drop, 0, sizeof(drop));
+    for (i = 0; i < g_capture.count; ++i) {
+        const ImtWireHeader* h = &g_capture.headers[i];
+        if (h->type == IMT_PACKET_TYPE_SLICE && h->fec_group == 0u &&
+            (h->fec_index == 1u || h->fec_index == 3u)) {
+            drop[i] = 1u;
+        }
+    }
+    imt_test_deliver(&assembler, drop);
+    CHECK(assembler.active_frame_seq == 10u);
+
+    /* seq 11 supersedes the damaged keyframe, but is gated instead of being
+     * published ahead of the requested retry. */
+    CHECK(imt_test_capture_frame(&packetizer, 11, NULL, 0) == 0);
+    imt_test_deliver(&assembler, NULL);
+    CHECK(assembler.latest.size == 0u);
+    CHECK(assembler.active_valid == 0u);
+    CHECK(assembler.keyframe_retry_pending == 1u);
+    CHECK(assembler.keyframe_retry_frame_seq == 10u);
+    CHECK(assembler.last_incomplete_is_new == 1u);
+
+    /* The same keyframe sequence can now travel backwards through the
+     * latest-wins gate and become the published decoder recovery point. */
+    CHECK(imt_test_capture_frame_flags(
+              &packetizer, 10,
+              IMT_PACKET_FLAG_KEYFRAME | IMT_PACKET_FLAG_CODEC_CONFIG,
+              NULL, 0) == 0);
+    imt_test_deliver(&assembler, NULL);
+    CHECK(assembler.latest.size == TEST_FRAME_SIZE);
+    CHECK(assembler.latest.frame_seq == 10u);
+    CHECK(assembler.latest.keyframe == 1u);
+    CHECK(assembler.keyframe_retry_pending == 0u);
+
+    CHECK(imt_test_capture_frame(&packetizer, 11, NULL, 0) == 0);
+    imt_test_deliver(&assembler, NULL);
+    CHECK(assembler.latest.frame_seq == 11u);
+
+    /* If the sender no longer retains seq 20, interframes remain gated and
+     * the next natural keyframe resumes the stream without a timer. */
+    CHECK(imt_test_capture_frame_flags(
+              &packetizer, 20,
+              IMT_PACKET_FLAG_KEYFRAME | IMT_PACKET_FLAG_CODEC_CONFIG,
+              NULL, 0) == 0);
+    memset(drop, 0, sizeof(drop));
+    for (i = 0; i < g_capture.count; ++i) {
+        const ImtWireHeader* h = &g_capture.headers[i];
+        if (h->type == IMT_PACKET_TYPE_SLICE && h->fec_group == 0u &&
+            (h->fec_index == 0u || h->fec_index == 2u)) {
+            drop[i] = 1u;
+        }
+    }
+    imt_test_deliver(&assembler, drop);
+    CHECK(imt_test_capture_frame(&packetizer, 21, NULL, 0) == 0);
+    imt_test_deliver(&assembler, NULL);
+    CHECK(assembler.keyframe_retry_pending == 1u);
+    CHECK(assembler.latest.frame_seq == 11u);
+
+    CHECK(imt_test_capture_frame_flags(
+              &packetizer, 30,
+              IMT_PACKET_FLAG_KEYFRAME | IMT_PACKET_FLAG_CODEC_CONFIG,
+              NULL, 0) == 0);
+    imt_test_deliver(&assembler, NULL);
+    CHECK(assembler.latest.frame_seq == 30u);
+    CHECK(assembler.latest.keyframe == 1u);
+    CHECK(assembler.keyframe_retry_pending == 0u);
+
+    CHECK(imt_assembler_set_keyframe_retry_enabled(&assembler, 0) == 0);
     imt_assembler_destroy(&assembler);
     imt_packetizer_destroy(&packetizer);
 }
@@ -1025,6 +1152,7 @@ int main(void)
     test_assembler_no_loss();
     test_assembler_one_loss_per_group();
     test_assembler_unrecoverable_then_supersede();
+    test_assembler_keyframe_retry_gate();
     test_assembler_parity_only_loss();
     test_assembler_parity_first_delivery();
     test_assembler_short_tail_recovery();

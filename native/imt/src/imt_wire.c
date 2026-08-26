@@ -40,6 +40,20 @@ static uint64_t imt_read_u64_le(const uint8_t* p)
     return (uint64_t)imt_read_u32_le(p) | ((uint64_t)imt_read_u32_le(p + 4) << 32);
 }
 
+static int imt_wire_packet_type_is_known(uint8_t type)
+{
+    switch (type) {
+        case IMT_PACKET_TYPE_SLICE:
+        case IMT_PACKET_TYPE_MAP:
+        case IMT_PACKET_TYPE_PARITY:
+        case IMT_PACKET_TYPE_FEEDBACK:
+        case IMT_PACKET_TYPE_KEYFRAME_NACK:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
 /* R6.1 byte layout (all little-endian):
  * 0:2 magic, 2:1 version, 3:1 type, 4:2 header_size, 6:2 flags,
  * 8:8 frame_seq, 16:8 capture_timestamp_ns, 24:4 frame_size,
@@ -88,6 +102,9 @@ int imt_wire_decode_header(const uint8_t* data, size_t size, ImtWireHeader* out_
 
     memset(&h, 0, sizeof(h));
     h.type = data[3];
+    if (!imt_wire_packet_type_is_known(h.type)) {
+        return -4;
+    }
     h.flags = imt_read_u16_le(data + 6);
     h.frame_seq = imt_read_u64_le(data + 8);
     h.capture_timestamp_ns = imt_read_u64_le(data + 16);
