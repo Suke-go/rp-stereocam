@@ -43,6 +43,12 @@ if ($LASTEXITCODE -ne 0) { throw "Failed to copy native sender sources." }
 & scp @sshOptions (Join-Path $repoRoot "tools/run_stereo_dual.sh") "$($target):$RemotePath/tools/"
 if ($LASTEXITCODE -ne 0) { throw "Failed to copy the Dual launch script." }
 
+# Never overwrite device-local capture tuning during a source deployment.
+# Stage only a reference file when the operator needs to create/update it.
+& scp @sshOptions (Join-Path $repoRoot "tools/metapuppet_pi.env") `
+    "$($target):$RemotePath/tools/metapuppet_pi.env.example"
+if ($LASTEXITCODE -ne 0) { throw "Failed to copy the capture config example." }
+
 $remoteBuild = "set -eu; " +
     "sed -i 's/\r$//' '$RemotePath/tools/run_stereo_dual.sh'; " +
     "chmod +x '$RemotePath/tools/run_stereo_dual.sh'; " +

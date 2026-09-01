@@ -84,6 +84,24 @@ void yuv420_eye_to_rgba_sbs(const uint8_t* yuv,
 }
 
 #if defined(MPS_ENABLE_GSTREAMER)
+bool environmentSwitch(const char* name, bool fallback)
+{
+    const char* value = std::getenv(name);
+    if (!value || !*value) {
+        return fallback;
+    }
+    if (std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
+        std::strcmp(value, "yes") == 0 || std::strcmp(value, "on") == 0) {
+        return true;
+    }
+    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 ||
+        std::strcmp(value, "no") == 0 || std::strcmp(value, "off") == 0) {
+        return false;
+    }
+    std::fprintf(stderr, "warning: ignoring invalid %s=%s\n", name, value);
+    return fallback;
+}
+
 class H264Encoder {
 public:
     ~H264Encoder()
@@ -106,18 +124,44 @@ public:
 
         gst_init(nullptr, nullptr);
         if (prefer_software) {
-            if (tryCreatePipeline(width, height, fps_, bitrate_kbps, false, intra_refresh, slice_max_size) != 0) {
+            if (tryCreatePipeline(width, height, fps_, bitrate_kbps, false,
+                                  intra_refresh, slice_max_size, false,
+                                  false) != 0 ||
+                startPipeline() != 0) {
                 return -1;
             }
-        } else if (tryCreatePipeline(width, height, fps_, bitrate_kbps, true, intra_refresh, slice_max_size) != 0 &&
-                   tryCreatePipeline(width, height, fps_, bitrate_kbps, false, intra_refresh, slice_max_size) != 0) {
-            return -1;
+            return 0;
         }
 
-        GstStateChangeReturn state_rc = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
-        if (state_rc == GST_STATE_CHANGE_FAILURE) {
-            destroy();
-            return -2;
+        const bool request_cbr = environmentSwitch("MPS_V4L2_CBR", true);
+        const bool enhanced_controls = request_cbr || intra_refresh;
+        if (tryCreatePipeline(width, height, fps_, bitrate_kbps, true,
+                              intra_refresh, slice_max_size,
+                              enhanced_controls, request_cbr) == 0 &&
+            startPipeline() == 0) {
+            return 0;
+        }
+
+        if (enhanced_controls) {
+            std::fprintf(
+                stderr,
+                "warning: v4l2h264enc rejected CBR/intra-refresh controls; "
+                "retrying the legacy bitrate-only hardware pipeline\n");
+            if (tryCreatePipeline(width, height, fps_, bitrate_kbps, true,
+                                  intra_refresh, slice_max_size, false,
+                                  false) == 0 &&
+                startPipeline() == 0) {
+                return 0;
+            }
+        }
+
+        std::fprintf(stderr,
+                     "warning: v4l2h264enc unavailable; falling back to x264enc\n");
+        if (tryCreatePipeline(width, height, fps_, bitrate_kbps, false,
+                              intra_refresh, slice_max_size, false,
+                              false) != 0 ||
+            startPipeline() != 0) {
+            return -1;
         }
         return 0;
     }
@@ -172,26 +216,61 @@ private:
                           uint32_t bitrate_kbps,
                           bool hardware,
                           bool intra_refresh,
-                          uint32_t slice_max_size)
+                          uint32_t slice_max_size,
+                          bool enhanced_hardware_controls,
+                          bool request_cbr)
     {
         destroy();
 
         char description[2048];
         if (hardware) {
+            char controls[512];
+            if (request_cbr && intra_refresh) {
+                std::snprintf(
+                    controls,
+                    sizeof(controls),
+                    "controls,video_bitrate_mode=1,video_bitrate=%u,"
+                    "h264_i_frame_period=%u,h264_intra_refresh_period=%u",
+                    bitrate_kbps * 1000u,
+                    fps * 60u,
+                    fps);
+            } else if (request_cbr) {
+                std::snprintf(
+                    controls,
+                    sizeof(controls),
+                    "controls,video_bitrate_mode=1,video_bitrate=%u,"
+                    "h264_i_frame_period=%u",
+                    bitrate_kbps * 1000u,
+                    fps);
+            } else if (intra_refresh && enhanced_hardware_controls) {
+                std::snprintf(
+                    controls,
+                    sizeof(controls),
+                    "controls,video_bitrate=%u,h264_i_frame_period=%u,"
+                    "h264_intra_refresh_period=%u",
+                    bitrate_kbps * 1000u,
+                    fps * 60u,
+                    fps);
+            } else {
+                std::snprintf(controls,
+                              sizeof(controls),
+                              "controls,video_bitrate=%u",
+                              bitrate_kbps * 1000u);
+            }
             std::snprintf(description,
                           sizeof(description),
                           "appsrc name=src is-live=true block=false format=time do-timestamp=false "
                           "max-buffers=1 max-bytes=0 max-time=0 leaky-type=downstream "
                           "caps=video/x-raw,format=I420,width=%u,height=%u,framerate=%u/1 "
                           "! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
-                          "! v4l2h264enc extra-controls=\"controls,video_bitrate=%u\" "
+                          "! v4l2h264enc extra-controls=\"%s\" "
                           "! h264parse config-interval=-1 "
                           "! video/x-h264,stream-format=byte-stream,alignment=au "
                           "! appsink name=sink emit-signals=false sync=false max-buffers=1 drop=true",
                           width,
                           height,
                           fps,
-                          bitrate_kbps * 1000u);
+                          controls);
         } else {
             char option_string[128] = "";
             const uint32_t key_int_max = intra_refresh ? fps * 60u : fps;
@@ -236,7 +315,34 @@ private:
             return -2;
         }
 
-        std::fprintf(stderr, "H.264 encoder: %s\n", hardware ? "v4l2h264enc" : "x264enc");
+        std::fprintf(stderr,
+                     "H.264 encoder candidate: %s%s\n",
+                     hardware ? "v4l2h264enc" : "x264enc",
+                     hardware && enhanced_hardware_controls
+                         ? " (CBR/intra-refresh requested)"
+                         : "");
+        return 0;
+    }
+
+    int startPipeline()
+    {
+        if (!pipeline_) {
+            return -1;
+        }
+        GstStateChangeReturn state_rc =
+            gst_element_set_state(pipeline_, GST_STATE_READY);
+        if (state_rc == GST_STATE_CHANGE_FAILURE ||
+            gst_element_get_state(pipeline_, nullptr, nullptr,
+                                  2u * GST_SECOND) ==
+                GST_STATE_CHANGE_FAILURE) {
+            destroy();
+            return -2;
+        }
+        state_rc = gst_element_set_state(pipeline_, GST_STATE_PLAYING);
+        if (state_rc == GST_STATE_CHANGE_FAILURE) {
+            destroy();
+            return -3;
+        }
         return 0;
     }
 

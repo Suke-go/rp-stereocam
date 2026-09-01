@@ -72,10 +72,15 @@ cd /home/admin/MetaPuppet-dual
 ./tools/run_stereo_dual.sh 192.168.50.1 5004 1280 720 60 0 1
 ```
 
-For exact calibration exposure at 30 fps:
+Camera controls are automatic when their entries in
+`tools/metapuppet_pi.env` are empty. For exact calibration exposure at 30 fps,
+set the recorded values explicitly in the device-local config or launch once
+with:
 
 ```bash
-MPS_USE_CALIBRATION_EXPOSURE=1 \
+MPS_CAMERA_AWB_GAINS=1.769247,2.343446 \
+MPS_CAMERA_SHUTTER_US=26974 MPS_CAMERA_ANALOG_GAIN=1.499268 \
+MPS_CAMERA_LEFT_LENS_POSITION=0.792 MPS_CAMERA_RIGHT_LENS_POSITION=0.787 \
   ./tools/run_stereo_dual.sh 192.168.50.1 5004 1280 720 30 0 1
 ```
 
@@ -101,7 +106,9 @@ backend's pairing limit.
 For stable colour and geometrically valid rectification, use the same manual
 camera controls that were recorded in the calibration JSON. Both the direct
 libcamera backend and the `rpicam-vid` fallback accept these variables. The
-current `s1` calibration (left camera 0, right camera 1) is launched as:
+launcher sources `MPS_CONFIG_FILE` (default `tools/metapuppet_pi.env`) with
+export enabled, so these settings reach the capture process. The current `s1`
+calibration (left camera 0, right camera 1) is launched as:
 
 ```bash
 MPS_CAMERA_AWB_GAINS=1.769247,2.343446 \
@@ -121,6 +128,15 @@ enabled. A shutter of 26974 microseconds cannot sustain 60 fps, so this exact
 calibration example uses 30 fps. `MPS_CAMERA_AWB_GAINS` disables AWB, while
 the per-eye lens positions put autofocus into manual mode. If none of these
 variables is set, the previous automatic camera behaviour is preserved.
+
+The legacy GStreamer H.264 launcher also reads the same config. It requests
+`video_bitrate_mode=CBR` when `MPS_V4L2_CBR=1` and requests periodic intra
+refresh when `MPS_H264_INTRA_REFRESH=1`. Because Raspberry Pi kernel/encoder
+control sets vary, startup first verifies the enhanced v4l2 pipeline. A driver
+that rejects those controls emits a warning and retries the prior
+bitrate-only `v4l2h264enc` pipeline; if hardware encoding itself is unavailable
+it falls back to the existing `x264enc` path. These controls do not affect the
+Dual x264 sender used by `run_stereo_dual.sh`.
 
 `MPS_ADAPTIVE=0` disables adaptive CRF. Dynamic resolution is deliberately not
 performed because it would also require coordinated decoder and Unity texture

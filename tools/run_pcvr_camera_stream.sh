@@ -6,8 +6,10 @@ repo_root="$(cd "${script_dir}/../.." && pwd)"
 config_file="${script_dir}/metapuppet_pi.env"
 
 if [[ -f "${config_file}" ]]; then
+  set -a
   # shellcheck disable=SC1090
   source "${config_file}"
+  set +a
 fi
 
 default_host="${METAPUPPET_PC_HOST:-}"
@@ -27,10 +29,13 @@ left_camera="${6:-${METAPUPPET_LEFT_CAMERA:-1}}"
 right_camera="${7:-${METAPUPPET_RIGHT_CAMERA:-0}}"
 max_skew_ms="${8:-8}"
 codec="${9:-raw}"
-bitrate_kbps="${10:-8000}"
+bitrate_kbps="${10:-${MPS_H264_BITRATE_KBPS:-8000}}"
 encoder_mode="${11:-auto}"
 max_pending_frames="${12:-1}"
 max_encode_age_ms="${13:-100}"
+enable_fec="${14:-${MPS_H264_FEC:-0}}"
+intra_refresh="${15:-${MPS_H264_INTRA_REFRESH:-1}}"
+slice_max_size="${16:-${MPS_H264_SLICE_MAX_SIZE:-0}}"
 
 sender="${repo_root}/build/pi_stream_sender/mps_libcamera_sbs_sender"
 if [[ ! -x "${sender}" ]]; then
@@ -48,8 +53,9 @@ echo "codec        : ${codec}"
 if [[ "${codec}" == "h264" || "${codec}" == "H264" ]]; then
   echo "bitrate      : ${bitrate_kbps} kbps"
   echo "encoder mode : ${encoder_mode}"
+  echo "rate control : v4l2-cbr=${MPS_V4L2_CBR:-1}, intra-refresh=${intra_refresh}"
   echo "latency gate : pending<=${max_pending_frames}, age<=${max_encode_age_ms}ms"
   echo "Unity texture: use native receiver H264, $((eye_width * 2))x${eye_height} BGRA32"
 fi
 
-exec "${sender}" "${host}" "${port}" "${eye_width}" "${eye_height}" "${fps}" "${left_camera}" "${right_camera}" "${max_skew_ms}" "${codec}" "${bitrate_kbps}" "${encoder_mode}" "${max_pending_frames}" "${max_encode_age_ms}"
+exec "${sender}" "${host}" "${port}" "${eye_width}" "${eye_height}" "${fps}" "${left_camera}" "${right_camera}" "${max_skew_ms}" "${codec}" "${bitrate_kbps}" "${encoder_mode}" "${max_pending_frames}" "${max_encode_age_ms}" "${enable_fec}" "${intra_refresh}" "${slice_max_size}"
