@@ -70,13 +70,31 @@ int main(void)
             return 4;
         }
     }
+    {
+        int keyframe = 0;
+        if (encode_frame(encoder, i420, TEST_GOP + 1u, &keyframe) != 0 ||
+            keyframe) {
+            fprintf(stderr, "pre-force frame was unexpectedly IDR\n");
+            mps_x264_destroy(encoder);
+            free(i420);
+            return 5;
+        }
+        if (mps_x264_force_idr_next(encoder) != 0 ||
+            encode_frame(encoder, i420, TEST_GOP + 2u, &keyframe) != 0 ||
+            !keyframe) {
+            fprintf(stderr, "forced frame was not IDR\n");
+            mps_x264_destroy(encoder);
+            free(i420);
+            return 6;
+        }
+    }
     mps_x264_destroy(encoder);
 
     /* The legacy entry point remains all-IDR for the existing SBS sender. */
     encoder = mps_x264_init(TEST_WIDTH, TEST_HEIGHT, TEST_FPS, 20.0f);
     if (!encoder) {
         free(i420);
-        return 5;
+        return 7;
     }
     for (frame = 0u; frame < 3u; ++frame) {
         int keyframe = 0;
@@ -84,7 +102,7 @@ int main(void)
             fprintf(stderr, "legacy encoder frame %u was not IDR\n", frame);
             mps_x264_destroy(encoder);
             free(i420);
-            return 6;
+            return 8;
         }
     }
 

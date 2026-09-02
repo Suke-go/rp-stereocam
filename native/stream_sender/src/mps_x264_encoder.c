@@ -19,6 +19,7 @@ struct MpsX264Ctx {
     int nal_capacity;
     int slice_capacity;
     int force_idr_each_frame;
+    int force_idr_next;
 };
 
 static int mps_x264_reserve(MpsX264Ctx* ctx, int size)
@@ -255,6 +256,15 @@ int mps_x264_set_crf(MpsX264Ctx* ctx, float crf)
     return x264_encoder_reconfig(ctx->enc, &param) == 0 ? 0 : -2;
 }
 
+int mps_x264_force_idr_next(MpsX264Ctx* ctx)
+{
+    if (!ctx || !ctx->enc) {
+        return -1;
+    }
+    ctx->force_idr_next = 1;
+    return 0;
+}
+
 int mps_x264_encode(MpsX264Ctx* ctx,
                     const uint8_t* sbs_i420,
                     const ImtMap* map,
@@ -284,7 +294,8 @@ int mps_x264_encode(MpsX264Ctx* ctx,
     }
     x264_picture_init(&pic_in);
     x264_picture_init(&pic_out);
-    pic_in.i_type = ctx->force_idr_each_frame ? X264_TYPE_IDR : X264_TYPE_AUTO;
+    pic_in.i_type = (ctx->force_idr_each_frame || ctx->force_idr_next)
+        ? X264_TYPE_IDR : X264_TYPE_AUTO;
     pic_in.i_pts = (int64_t)ctx->pts++;
     pic_in.img.i_csp = X264_CSP_I420;
     pic_in.img.i_plane = 3;
@@ -302,6 +313,9 @@ int mps_x264_encode(MpsX264Ctx* ctx,
     }
     if (payload_size == 0 || nal_count == 0) {
         return 0;
+    }
+    if (pic_out.b_keyframe) {
+        ctx->force_idr_next = 0;
     }
     if (mps_x264_reserve(ctx, payload_size) != 0) {
         return -3;

@@ -51,6 +51,7 @@
 #define MPS_SEND_BATCH_DATAGRAMS 16u
 #define MPS_SEND_DATAGRAM_BYTES (IMT_WIRE_HEADER_SIZE + IMT_DEFAULT_MAX_PAYLOAD)
 #define MPS_NACK_RECEIVE_TIMEOUT_MS 100u
+#define MPS_FORCE_IDR_MIN_INTERVAL_NS 500000000ull
 #ifndef SO_MAX_PACING_RATE
 #define SO_MAX_PACING_RATE 47
 #endif
@@ -424,8 +425,14 @@ typedef struct {
     uint64_t nacks_received;
     uint64_t nack_retries_sent;
     uint64_t nacks_ignored;
+    uint64_t force_idr_requests;
+    uint64_t force_idr_applied;
+    uint64_t force_idr_rate_limited;
+    uint64_t force_idr_failures;
+    uint64_t last_force_idr_request_ns;
     uint64_t last_nack_error_ns;
     int pending_nack;
+    int pending_force_idr;
     int nack_stop;
     int nack_lock_ready;
     int nack_thread_started;
@@ -506,14 +513,29 @@ static void* eye_stream_nack_loop(void* arg)
 
         pthread_mutex_lock(&eye->nack_lock);
         if (!eye->nack_stop) {
-            eye->nacks_received += 1u;
-            if (eye->last_keyframe_nal_size != 0u &&
-                eye->last_keyframe_frame_seq == requested_frame_seq &&
-                !eye->last_keyframe_retried) {
-                eye->pending_nack_frame_seq = requested_frame_seq;
-                eye->pending_nack = 1;
+            if (requested_frame_seq ==
+                IMT_KEYFRAME_NACK_FORCE_IDR_FRAME_SEQ) {
+                const uint64_t request_time_ns = now_ns();
+                if (!eye->pending_force_idr &&
+                    (eye->last_force_idr_request_ns == 0u ||
+                     request_time_ns - eye->last_force_idr_request_ns >=
+                         MPS_FORCE_IDR_MIN_INTERVAL_NS)) {
+                    eye->pending_force_idr = 1;
+                    eye->last_force_idr_request_ns = request_time_ns;
+                    eye->force_idr_requests += 1u;
+                } else {
+                    eye->force_idr_rate_limited += 1u;
+                }
             } else {
-                eye->nacks_ignored += 1u;
+                eye->nacks_received += 1u;
+                if (eye->last_keyframe_nal_size != 0u &&
+                    eye->last_keyframe_frame_seq == requested_frame_seq &&
+                    !eye->last_keyframe_retried) {
+                    eye->pending_nack_frame_seq = requested_frame_seq;
+                    eye->pending_nack = 1;
+                } else {
+                    eye->nacks_ignored += 1u;
+                }
             }
         }
         pthread_mutex_unlock(&eye->nack_lock);
@@ -635,13 +657,20 @@ static void eye_stream_destroy(EyeStream* eye)
         pthread_join(eye->nack_thread, NULL);
         eye->nack_thread_started = 0;
     }
-    if (eye->nack_lock_ready && eye->nacks_received != 0u) {
+    if (eye->nack_lock_ready &&
+        (eye->nacks_received != 0u || eye->force_idr_requests != 0u ||
+         eye->force_idr_rate_limited != 0u)) {
         fprintf(stderr,
-                "%s: NACK summary received=%llu retransmitted=%llu ignored=%llu\n",
+                "%s: NACK summary received=%llu retransmitted=%llu ignored=%llu "
+                "forceIdr=%llu/%llu limited=%llu failed=%llu\n",
                 eye->label,
                 (unsigned long long)eye->nacks_received,
                 (unsigned long long)eye->nack_retries_sent,
-                (unsigned long long)eye->nacks_ignored);
+                (unsigned long long)eye->nacks_ignored,
+                (unsigned long long)eye->force_idr_applied,
+                (unsigned long long)eye->force_idr_requests,
+                (unsigned long long)eye->force_idr_rate_limited,
+                (unsigned long long)eye->force_idr_failures);
     }
     if (eye->ctx.fd >= 0) {
         close(eye->ctx.fd);
@@ -749,6 +778,35 @@ static void eye_stream_retry_pending_keyframe(EyeStream* eye)
     } else {
         fprintf(stderr, "%s: keyframe retransmit seq=%llu failed: %d\n",
                 eye->label, (unsigned long long)requested_frame_seq, send_rc);
+    }
+}
+
+static void eye_stream_apply_pending_force_idr(EyeStream* eye)
+{
+    int pending;
+    pthread_mutex_lock(&eye->nack_lock);
+    pending = eye->pending_force_idr;
+    eye->pending_force_idr = 0;
+    pthread_mutex_unlock(&eye->nack_lock);
+    if (!pending) {
+        return;
+    }
+
+    /* x264 is owned by this eye worker. Never reconfigure it from the UDP
+     * control thread. If the active encoder cannot honor the request, retain
+     * the existing periodic GOP as the compatibility fallback. */
+    if (mps_x264_force_idr_next(eye->x264) == 0) {
+        pthread_mutex_lock(&eye->nack_lock);
+        eye->force_idr_applied += 1u;
+        pthread_mutex_unlock(&eye->nack_lock);
+        fprintf(stderr, "%s: FORCE_IDR accepted for next frame\n", eye->label);
+    } else {
+        pthread_mutex_lock(&eye->nack_lock);
+        eye->force_idr_failures += 1u;
+        pthread_mutex_unlock(&eye->nack_lock);
+        fprintf(stderr,
+                "warning: %s encoder cannot force an IDR; waiting for natural keyframe\n",
+                eye->label);
     }
 }
 
@@ -863,6 +921,7 @@ static void* eye_worker_loop(void* arg)
         pthread_mutex_unlock(&worker->lock);
 
         eye_stream_retry_pending_keyframe(worker->eye);
+        eye_stream_apply_pending_force_idr(worker->eye);
         eye_stream_encode_and_send(worker->eye, i420, timestamp_ns, frame_seq);
         eye_stream_retry_pending_keyframe(worker->eye);
 
@@ -1226,7 +1285,7 @@ int main(int argc, char** argv)
                 "      MPS_CAMERA_AWB_GAINS=red,blue, MPS_CAMERA_SHUTTER_US=N,\n"
                 "      MPS_CAMERA_ANALOG_GAIN=N, MPS_CAMERA_LEFT_LENS_POSITION=N,\n"
                 "      MPS_CAMERA_RIGHT_LENS_POSITION=N,\n"
-                "      MPS_KEYFRAME_NACK=1 (set 0 to disable one-shot keyframe retry),\n"
+                "      MPS_KEYFRAME_NACK=1 (set 0 to disable replay/FORCE_IDR recovery),\n"
                 "      MPS_ADAPTIVE=1, MPS_ADAPTIVE_TARGET_MS=ceil(1000/fps), "
                 "MPS_ADAPTIVE_CRF_MAX=30\n",
                 argv[0]);

@@ -40,6 +40,10 @@ uint32_t mps_x264_mb_width(const MpsX264Ctx* ctx);
 /* Reconfigure CRF between frames. Call only while no thread is inside
  * mps_x264_encode for this context. */
 int mps_x264_set_crf(MpsX264Ctx* ctx, float crf);
+/* Request an IDR for the next access unit. Call on the same worker thread as
+ * mps_x264_encode; the encoder context is intentionally not internally
+ * synchronized. */
+int mps_x264_force_idr_next(MpsX264Ctx* ctx);
 
 int mps_x264_encode(MpsX264Ctx* ctx,
                     const uint8_t* sbs_i420,

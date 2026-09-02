@@ -38,6 +38,11 @@ extern "C" {
 #define IMT_PACKET_TYPE_FEEDBACK 3u
 #define IMT_PACKET_TYPE_KEYFRAME_NACK 4u
 
+/* IMT v1 KEYFRAME_NACK control sentinel. A concrete frame_seq requests the
+ * existing one-shot cached replay; UINT64_MAX requests a newly encoded IDR.
+ * Old senders safely ignore it as a non-matching cached sequence. */
+#define IMT_KEYFRAME_NACK_FORCE_IDR_FRAME_SEQ UINT64_MAX
+
 #define IMT_PACKET_FLAG_KEYFRAME (1u << 0)
 #define IMT_PACKET_FLAG_CODEC_CONFIG (1u << 1)
 

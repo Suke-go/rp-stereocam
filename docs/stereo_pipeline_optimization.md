@@ -53,6 +53,15 @@ and host queueing-discipline changes are intentionally outside its scope.
   retry. A NACK accidentally delivered to an IMT assembler is explicitly
   ignored without changing active video state.
 
+- `KEYFRAME_NACK.frame_seq = UINT64_MAX` is the IMT v1 `FORCE_IDR` sentinel.
+  It complements cached replay when a decoder has discarded its reference
+  state. The receive thread only publishes a bounded request; the existing eye
+  worker applies it immediately before the next x264 encode. Requests are
+  limited to one accepted request per eye per 500 ms. Concrete sequence NACKs
+  retain their original one-shot semantics, and older senders ignore the
+  sentinel as a cache miss. The legacy SBS/GStreamer launcher has no dual-eye
+  control sockets and retains periodic-keyframe recovery.
+
 ## Deliberately not implemented as a local patch
 
 Sending a slice before the access unit finishes requires a wire-protocol

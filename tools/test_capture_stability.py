@@ -6,6 +6,24 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CaptureStabilityContract(unittest.TestCase):
+    def test_force_idr_control_stays_on_encoder_worker(self):
+        sender = (
+            ROOT / "native/stream_sender/src/mps_stereo_x264_sender.c"
+        ).read_text()
+        encoder = (
+            ROOT / "native/stream_sender/src/mps_x264_encoder.c"
+        ).read_text()
+        wire = (ROOT / "native/imt/include/imt.h").read_text()
+        self.assertIn(
+            "IMT_KEYFRAME_NACK_FORCE_IDR_FRAME_SEQ UINT64_MAX", wire
+        )
+        self.assertIn("MPS_FORCE_IDR_MIN_INTERVAL_NS 500000000ull", sender)
+        self.assertIn(
+            "eye_stream_apply_pending_force_idr(worker->eye);", sender
+        )
+        self.assertIn("mps_x264_force_idr_next", sender)
+        self.assertIn("ctx->force_idr_next", encoder)
+
     def test_dual_launcher_uses_exported_opt_in_camera_config(self):
         launcher = (ROOT / "tools/run_stereo_dual.sh").read_text()
         self.assertIn('config_file="${MPS_CONFIG_FILE:-', launcher)

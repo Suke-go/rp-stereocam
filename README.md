@@ -160,6 +160,16 @@ same-sequence retry would be rejected by latest-wins ordering. Set
 an A/B comparison.
 The PC diagnostics window exposes per-eye `nack` and `nackFail` counters.
 
+IMT wire version 1 also reserves `KEYFRAME_NACK.frame_seq = UINT64_MAX` as a
+backward-compatible `FORCE_IDR` request. A concrete sequence keeps the cached
+one-shot replay behavior above. The sentinel is rate-limited independently per
+eye and is consumed by that eye's encoder worker, so x264 is never touched by
+the UDP control thread. The next encoded access unit is an IDR; an encoder that
+cannot honor the request warns and falls back to its normal GOP. Older senders
+treat the sentinel as a non-matching sequence and safely ignore it. The legacy
+SBS/GStreamer launcher does not own the dual-eye reverse control sockets and
+therefore continues to recover at its configured natural keyframe.
+
 To verify the Pi response independently of the decoder, run the probe on the
 destination PC, then start the Pi sender against that PC and port pair:
 

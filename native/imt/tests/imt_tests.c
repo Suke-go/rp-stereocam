@@ -413,6 +413,10 @@ static void test_wire(void)
     CHECK(decoded.type == IMT_PACKET_TYPE_KEYFRAME_NACK);
     CHECK(decoded.frame_seq == header.frame_seq);
     CHECK(decoded.payload_size == 0u);
+    header.frame_seq = IMT_KEYFRAME_NACK_FORCE_IDR_FRAME_SEQ;
+    CHECK(imt_wire_encode_header(&header, buffer, IMT_WIRE_HEADER_SIZE) == 0);
+    CHECK(imt_wire_decode_header(buffer, IMT_WIRE_HEADER_SIZE, &decoded) == 0);
+    CHECK(decoded.frame_seq == UINT64_MAX);
     buffer[3] = 0x7Fu;
     CHECK(imt_wire_decode_header(buffer, IMT_WIRE_HEADER_SIZE, &decoded) == -4);
 
